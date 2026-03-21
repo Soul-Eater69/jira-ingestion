@@ -31,6 +31,8 @@ async def ingest_ticket(
     embedding_client: Optional[Any] = None,
     dict_path: Optional[str] = None,
     force_reprocess: bool = False,
+    storage_dir: Optional[str] = None,
+    storage_fmt: str = "json",
 ) -> dict:
     """
     Fetch, process, and index a single Jira ticket.
@@ -47,6 +49,9 @@ async def ingest_ticket(
         embedding_client:  OpenAI-compatible embedding client (optional).
         dict_path:         Path to entity dictionary files.
         force_reprocess:   If True, skip idempotency check.
+        storage_dir:       If set, persist the assembled document here before
+                           indexing. Accepts a directory path.
+        storage_fmt:       'json' | 'jsonl' | 'parquet' (default 'json').
     """
     # Idempotency check
     if not force_reprocess:
@@ -77,6 +82,12 @@ async def ingest_ticket(
         embedding_client=embedding_client,
         dict_path=dict_path,
     )
+
+    # Persist to disk before indexing (optional)
+    if storage_dir:
+        from .storage import DocumentStore
+        store = DocumentStore(output_dir=storage_dir)
+        store.save(document, fmt=storage_fmt)  # type: ignore[arg-type]
 
     # Index
     from .indexing import index_retrieval_view, index_supervision_view

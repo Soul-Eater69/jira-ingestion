@@ -69,7 +69,12 @@ async def demo(ticket_id: str) -> None:
 # Full ingestion mode
 # ---------------------------------------------------------------------------
 
-async def ingest(ticket_id: str, output_file: Optional[str] = None) -> dict:
+async def ingest(
+    ticket_id: str,
+    output_file: Optional[str] = None,
+    storage_dir: Optional[str] = None,
+    storage_fmt: str = "json",
+) -> dict:
     """Run the full ingestion pipeline for a single ticket."""
     from src.clients.jira.value_stream_client import JiraValueStreamClient
     from src.config import (
@@ -96,6 +101,11 @@ async def ingest(ticket_id: str, output_file: Optional[str] = None) -> dict:
     use_pinecone = bool(PINECONE_API_KEY)
     coarse, fine, meta_idx, supervision = create_indexes(use_pinecone=use_pinecone)
 
+    # Default storage dir to output/documents if not given via --output-file
+    resolved_storage_dir = storage_dir or (
+        os.path.dirname(output_file) if output_file else "output/documents"
+    )
+
     try:
         document = await ingest_ticket(
             ticket_key=ticket_id,
@@ -107,6 +117,8 @@ async def ingest(ticket_id: str, output_file: Optional[str] = None) -> dict:
             llm_client=llm_client,
             embedding_client=embedding_client,
             trigger="cli",
+            storage_dir=resolved_storage_dir,
+            storage_fmt=storage_fmt,
         )
     finally:
         await jira_client.close()
@@ -138,15 +150,19 @@ async def ingest(ticket_id: str, output_file: Optional[str] = None) -> dict:
 # Batch mode
 # ---------------------------------------------------------------------------
 
-async def batch(keys_file: str) -> None:
+async def batch(
+    keys_file: str,
+    storage_dir: Optional[str] = None,
+    storage_fmt: str = "jsonl",
+) -> None:
     """Ingest multiple tickets from a newline-separated keys file."""
     with open(keys_file, "r", encoding="utf-8") as fh:
         keys = [line.strip() for line in fh if line.strip() and not line.startswith("#")]
 
-    print(f"Ingesting {len(keys)} tickets...")
+    print(f"Ingesting {len(keys)} tickets → format={storage_fmt} dir={storage_dir or 'output/documents'}...")
     for key in keys:
         try:
-            await ingest(key)
+            await ingest(key, storage_dir=storage_dir, storage_fmt=storage_fmt)
         except Exception as exc:
             logger.error("Failed to ingest %s: %s", key, exc)
 
@@ -175,20 +191,47 @@ from typing import Any  # noqa: E402
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    args = sys.argv[1:]
-    if not args or args[0] in ("-h", "--help"):
-        print(__doc__)
-        sys.exit(0)
+    import argparse
 
-    mode = args[0]
-    if mode == "demo" and len(args) >= 2:
-        asyncio.run(demo(args[1]))
-    elif mode == "ingest" and len(args) >= 2:
-        output = args[2] if len(args) >= 3 else None
-        asyncio.run(ingest(args[1], output_file=output))
-    elif mode == "batch" and len(args) >= 2:
-        asyncio.run(batch(args[1]))
+    parser = argparse.ArgumentParser(
+        description="Jira ingestion pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    sub = parser.add_subparsers(dest="mode")
+
+    p_demo = sub.add_parser("demo", help="Fetch and print ticket data (no indexing)")
+    p_demo.add_argument("ticket_id")
+
+    p_ingest = sub.add_parser("ingest", help="Full ingestion for a single ticket")
+    p_ingest.add_argument("ticket_id")
+    p_ingest.add_argument("--output-dir", default="output/documents",
+                          help="Directory to save the document (default: output/documents)")
+    p_ingest.add_argument("--fmt", default="json", choices=["json", "jsonl", "parquet"],
+                          help="Storage format (default: json)")
+    p_ingest.add_argument("--output-file", default=None,
+                          help="Deprecated: use --output-dir instead")
+
+    p_batch = sub.add_parser("batch", help="Ingest multiple tickets from a keys file")
+    p_batch.add_argument("keys_file", help="Newline-separated list of ticket keys")
+    p_batch.add_argument("--output-dir", default="output/documents",
+                         help="Directory to save documents (default: output/documents)")
+    p_batch.add_argument("--fmt", default="jsonl", choices=["json", "jsonl", "parquet"],
+                         help="Storage format (default: jsonl for batch)")
+
+    ns = parser.parse_args()
+
+    if ns.mode == "demo":
+        asyncio.run(demo(ns.ticket_id))
+    elif ns.mode == "ingest":
+        asyncio.run(ingest(
+            ns.ticket_id,
+            output_file=ns.output_file,
+            storage_dir=ns.output_dir,
+            storage_fmt=ns.fmt,
+        ))
+    elif ns.mode == "batch":
+        asyncio.run(batch(ns.keys_file, storage_dir=ns.output_dir, storage_fmt=ns.fmt))
     else:
-        print(f"Unknown command: {args}")
-        print(__doc__)
+        parser.print_help()
         sys.exit(1)
