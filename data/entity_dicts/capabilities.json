@@ -1,0 +1,7 @@
+[
+  {"canonical": "fraud detection", "aliases": ["fraud screening", "fraud prevention", "anti-fraud", "fraud monitoring"]},
+  {"canonical": "claims intake", "aliases": ["claims submission", "claim filing", "FNOL", "first notice of loss"]},
+  {"canonical": "document verification", "aliases": ["doc verification", "document check", "ID verification"]},
+  {"canonical": "customer onboarding", "aliases": ["onboarding", "account opening", "new customer"]},
+  {"canonical": "risk assessment", "aliases": ["risk scoring", "credit risk", "risk evaluation"]}
+]

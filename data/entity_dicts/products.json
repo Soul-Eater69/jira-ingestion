@@ -1,0 +1,7 @@
+[
+  {"canonical": "Fraud Screening Service", "aliases": ["fraud screener", "FSS", "fraud-screening-svc", "fraud screening"]},
+  {"canonical": "KYC Service", "aliases": ["kyc", "know your customer", "kyc-svc", "identity verification"]},
+  {"canonical": "Mobile Banking App", "aliases": ["mobile app", "MBA", "mobile banking", "banking app"]},
+  {"canonical": "Risk Engine", "aliases": ["risk scoring", "risk-engine", "scoring engine"]},
+  {"canonical": "Payment Processor", "aliases": ["payments", "payment processing", "payment gateway"]}
+]

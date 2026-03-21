@@ -1,0 +1,6 @@
+[
+  {"canonical": "REST API Gateway", "aliases": ["api gateway", "gateway", "apigw", "API gateway"]},
+  {"canonical": "Auth Service", "aliases": ["authentication", "auth-svc", "identity service", "SSO"]},
+  {"canonical": "Core Ledger", "aliases": ["ledger", "core banking", "core-ledger"]},
+  {"canonical": "Notification Service", "aliases": ["notifications", "alerts", "notification-svc"]}
+]

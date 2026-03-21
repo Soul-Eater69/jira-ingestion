@@ -1,0 +1,7 @@
+[
+  {"canonical": "AWS Lambda", "aliases": ["lambda", "serverless", "AWS serverless"]},
+  {"canonical": "Apache Kafka", "aliases": ["kafka", "event streaming", "kafka streams"]},
+  {"canonical": "Salesforce", "aliases": ["SFDC", "CRM", "salesforce CRM"]},
+  {"canonical": "Kubernetes", "aliases": ["k8s", "kube", "container orchestration"]},
+  {"canonical": "PostgreSQL", "aliases": ["postgres", "PG", "relational DB"]}
+]

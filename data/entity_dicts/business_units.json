@@ -1,0 +1,7 @@
+[
+  {"canonical": "Claims Team", "aliases": ["claims", "claims department", "claims division"]},
+  {"canonical": "Digital Banking", "aliases": ["digital", "online banking", "digital channels"]},
+  {"canonical": "Risk Operations", "aliases": ["risk ops", "risk team", "risk management"]},
+  {"canonical": "Insurance", "aliases": ["insurance division", "insurance team", "P&C"]},
+  {"canonical": "Retail Banking", "aliases": ["retail", "branch banking", "consumer banking"]}
+]
