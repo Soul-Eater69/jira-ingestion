@@ -1,0 +1,61 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jira-ingestion"
+version = "0.1.0"
+description = "Jira ticket ingestion pipeline — extracts, chunks, embeds, and indexes idea cards"
+requires-python = ">=3.10"
+dependencies = [
+    # Async HTTP
+    "aiohttp>=3.9.0",
+    "aiofiles>=23.0.0",
+    # Jira API
+    "jira>=3.6.0",
+    # Document extraction (MarkItDown pulls in pptx/pdf/docx support)
+    "markitdown[all]>=0.0.1",
+    # PDF triage peek (optional but recommended)
+    "PyMuPDF>=1.23.0",
+    # Text processing
+    "langdetect>=1.0.9",
+    # LLM + Embeddings
+    "openai>=1.30.0",
+    # Config
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+# Parquet output support
+parquet = ["pyarrow>=15.0.0"]
+# Pinecone vector index
+pinecone = ["pinecone-client>=3.0.0"]
+# Everything
+all = ["jira-ingestion[parquet,pinecone]"]
+
+[project.scripts]
+jira-ingest = "main:main_cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/",
+    "data/entity_dicts/",
+    "integration/",
+    "requirements.txt",
+    ".env.example",
+]
+
+# ── For IDP-VALUE-STREAMS: add this block to the parent pyproject.toml ────────
+#
+# [tool.uv.sources]
+# jira-ingestion = { path = "jira-ingestion", editable = true }
+#
+# [project.dependencies]
+# ...existing deps...
+# "jira-ingestion[all]",
+#
+# Then run: uv sync
+# -----------------------------------------------------------------------------
