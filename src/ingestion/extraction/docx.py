@@ -1,17 +1,26 @@
 """
-DOCX content extraction using python-docx.
-Chunks by heading-delimited sections. Tables extracted separately.
+DOCX content extraction via MarkItDown.
+
+MarkItDown converts DOCX to Markdown with headings preserved as # markers.
+We split on heading boundaries to produce one chunk per logical section.
+Tables in the output are kept inline (MarkItDown renders them as Markdown tables).
 """
 
 from __future__ import annotations
 
 import io
 import logging
+import re
 from typing import Optional
 
-from .tables import serialize_docx_table
+from .markitdown import extract_markdown, word_count
 
 logger = logging.getLogger(__name__)
+
+# Match any Markdown heading (# through ######)
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
+
+_CHUNK_MIN_WORDS = 10
 
 
 # ---------------------------------------------------------------------------
@@ -20,127 +29,57 @@ logger = logging.getLogger(__name__)
 
 def extract_docx(file_bytes: bytes) -> dict:
     """
-    Extract text and tables from a DOCX file, chunked by headings.
+    Extract section chunks from a DOCX file via MarkItDown.
 
     Returns:
         {
-            "chunks": [section-chunk-dict, ...],
+            "chunks":        [section-chunk-dict, ...],
             "section_count": int,
-            "has_tables": bool,
+            "has_tables":    bool,
         }
     """
-    try:
-        from docx import Document  # type: ignore
-        from docx.oxml.ns import qn  # type: ignore
-    except ImportError as exc:
-        raise ImportError("python-docx is required for DOCX extraction") from exc
-
-    doc = Document(io.BytesIO(file_bytes))
-    chunks: list[dict] = []
-    table_chunks: list[dict] = []
-
-    current_heading: Optional[str] = None
-    current_paragraphs: list[str] = []
-    section_idx = 0
-
-    def flush_section() -> None:
-        nonlocal section_idx, current_heading, current_paragraphs
-        if not current_paragraphs:
-            return
-        text_parts: list[str] = []
-        if current_heading:
-            text_parts.append(f"## {current_heading}")
-        text_parts.extend(current_paragraphs)
-        full_text = "\n\n".join(text_parts).strip()
-        if full_text and len(full_text.split()) >= 5:
-            chunks.append(
-                {
-                    "chunk_id": f"docx-section-{section_idx}",
-                    "source": "docx_section",
-                    "text": full_text,
-                    "section_title": current_heading or "",
-                    "word_count": len(full_text.split()),
-                    "is_boilerplate": False,
-                    "weight_multiplier": 1.0,
-                    "extraction_confidence": 1.0,
-                    "extraction_method": "docx_native",
-                }
-            )
-        section_idx += 1
-        current_heading = None
-        current_paragraphs = []
-
-    for block in _iter_block_items(doc):
-        kind = block.get("type")
-        if kind == "heading":
-            flush_section()
-            current_heading = block["text"]
-        elif kind == "paragraph":
-            text = block["text"].strip()
-            if text:
-                current_paragraphs.append(text)
-        elif kind == "table":
-            tbl = block["table"]
-            serialized = serialize_docx_table(tbl, context=current_heading)
-            if serialized["full_text"]:
-                table_chunks.append(
-                    {
-                        "chunk_id": f"docx-table-{len(table_chunks)}",
-                        "source": "docx_table",
-                        "text": serialized["full_text"],
-                        "table_summary": serialized["summary"],
-                        "row_count": serialized["row_count"],
-                        "col_count": serialized["col_count"],
-                        "word_count": len(serialized["full_text"].split()),
-                        "is_boilerplate": False,
-                        "weight_multiplier": 0.9,
-                        "extraction_confidence": 1.0,
-                        "extraction_method": "docx_native",
-                    }
-                )
-
-    flush_section()
-    all_chunks = chunks + table_chunks
+    md_text = extract_markdown(file_bytes, "document.docx")
+    chunks = _split_by_headings(md_text)
+    has_tables = any("|" in c["text"] for c in chunks)
 
     return {
-        "chunks": all_chunks,
+        "chunks": chunks,
         "section_count": len(chunks),
-        "has_tables": bool(table_chunks),
+        "has_tables": has_tables,
     }
 
 
 def cheap_peek_docx(file_bytes: bytes) -> dict:
     """
-    Read structural metadata from a DOCX without full extraction.
-    Uses the document.xml size as a proxy for word count.
+    Read structural metadata from a DOCX without running MarkItDown.
+    Uses only stdlib zipfile to inspect document.xml size and first heading.
     """
-    import zipfile as zf_mod
-
     try:
-        with zf_mod.ZipFile(io.BytesIO(file_bytes)) as zf:
+        import zipfile
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
             names = zf.namelist()
-            doc_size = 0
+            if "word/document.xml" not in names:
+                return {"error": "Not a valid DOCX"}
+
+            doc_size = zf.getinfo("word/document.xml").file_size
+            raw = zf.read("word/document.xml")
+
+            has_tables = b"<w:tbl" in raw
             first_heading: Optional[str] = None
 
-            if "word/document.xml" in names:
-                doc_size = zf.getinfo("word/document.xml").file_size
-                # Cheap heading scan
-                import xml.etree.ElementTree as ET
-                root = ET.fromstring(zf.read("word/document.xml"))
-                ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-                for para in root.findall(".//w:p", ns):
-                    style = para.find(".//w:pStyle", ns)
-                    if style is not None and "Heading" in (style.get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val") or ""):
-                        texts = para.findall(".//w:t", ns)
-                        first_heading = "".join(t.text or "" for t in texts).strip()
-                        if first_heading:
-                            break
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(raw)
+            ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+            for para in root.findall(".//w:p", ns):
+                style = para.find(".//w:pStyle", ns)
+                val = (style.get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val") or "") if style is not None else ""
+                if "Heading" in val:
+                    texts = para.findall(".//w:t", ns)
+                    first_heading = "".join(t.text or "" for t in texts).strip() or None
+                    if first_heading:
+                        break
 
-            has_tables = "word/document.xml" in names and b"<w:tbl" in zf.read("word/document.xml")
-
-        # Rough word count estimate: ~6 bytes per word in XML
         estimated_words = doc_size // 6
-
         return {
             "estimated_word_count": estimated_words,
             "first_heading": first_heading,
@@ -155,31 +94,48 @@ def cheap_peek_docx(file_bytes: bytes) -> dict:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _iter_block_items(doc: Any):
+def _split_by_headings(md_text: str) -> list[dict]:
     """
-    Yield paragraphs and tables in document order as dicts.
-    Handles the fact that python-docx exposes paragraphs and tables separately
-    unless you walk the XML body directly.
+    Split Markdown text on heading boundaries.
+    Each section = the heading + all content until the next heading.
     """
-    try:
-        from docx.oxml.ns import qn  # type: ignore
-        from docx.table import Table  # type: ignore
-        from docx.text.paragraph import Paragraph  # type: ignore
+    # Find all heading positions
+    matches = list(_HEADING_RE.finditer(md_text))
 
-        body = doc.element.body
-        for child in body:
-            tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
-            if tag == "p":
-                para = Paragraph(child, doc)
-                style_name = para.style.name if para.style else ""
-                if "Heading" in style_name:
-                    yield {"type": "heading", "text": para.text}
-                else:
-                    yield {"type": "paragraph", "text": para.text}
-            elif tag == "tbl":
-                yield {"type": "table", "table": Table(child, doc)}
-    except Exception as exc:
-        logger.debug("Error iterating DOCX blocks: %s", exc)
-        # Fallback: just yield paragraphs
-        for para in doc.paragraphs:
-            yield {"type": "paragraph", "text": para.text}
+    if not matches:
+        # No headings — treat entire document as one chunk
+        text = md_text.strip()
+        if text and word_count(text) >= _CHUNK_MIN_WORDS:
+            return [_make_chunk(0, None, text)]
+        return []
+
+    chunks: list[dict] = []
+    for i, match in enumerate(matches):
+        heading_text = match.group(2).strip()
+        start = match.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(md_text)
+        section_text = md_text[start:end].strip()
+
+        if word_count(section_text) >= _CHUNK_MIN_WORDS:
+            chunks.append(_make_chunk(i, heading_text, section_text))
+
+    # Capture any content before the first heading
+    preamble = md_text[: matches[0].start()].strip()
+    if preamble and word_count(preamble) >= _CHUNK_MIN_WORDS:
+        chunks.insert(0, _make_chunk(-1, None, preamble))
+
+    return chunks
+
+
+def _make_chunk(idx: int, title: Optional[str], text: str) -> dict:
+    return {
+        "chunk_id": f"docx-section-{idx}",
+        "source": "docx_section",
+        "text": text,
+        "section_title": title or "",
+        "word_count": word_count(text),
+        "is_boilerplate": False,
+        "weight_multiplier": 1.0,
+        "extraction_confidence": 0.95,
+        "extraction_method": "markitdown",
+    }

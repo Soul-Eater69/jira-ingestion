@@ -317,26 +317,27 @@ def confirm_is_idea_card(extracted: Optional[dict]) -> bool:
 # ---------------------------------------------------------------------------
 
 def _full_extract_text(file_bytes: bytes, ext: str) -> dict:
-    """Run just enough extraction to confirm the document is an idea card."""
+    """
+    Run just enough extraction to confirm the document is an idea card.
+    All formats go through MarkItDown via their respective module.
+    """
     try:
         if ext in ("pptx", "ppt"):
             from .extraction.pptx import extract_pptx
             result = extract_pptx(file_bytes, max_slides=60)
-            non_bp = sum(1 for c in result["chunks"] if not c.get("is_boilerplate"))
-            text = " ".join(c["text"] for c in result["chunks"] if not c.get("is_boilerplate"))
-            return {"text": text, "non_boilerplate_count": non_bp}
-
         elif ext == "pdf":
             from .extraction.pdf import extract_pdf
-            result = extract_pdf(file_bytes, max_pages=30)
-            text = " ".join(c["text"] for c in result["chunks"])
-            return {"text": text, "non_boilerplate_count": len(result["chunks"])}
-
+            result = extract_pdf(file_bytes)
         elif ext in ("docx", "doc"):
             from .extraction.docx import extract_docx
             result = extract_docx(file_bytes)
-            text = " ".join(c["text"] for c in result["chunks"])
-            return {"text": text, "non_boilerplate_count": len(result["chunks"])}
+        else:
+            return {}
+
+        non_bp = sum(1 for c in result["chunks"] if not c.get("is_boilerplate"))
+        text = " ".join(c["text"] for c in result["chunks"] if not c.get("is_boilerplate"))
+        return {"text": text, "non_boilerplate_count": non_bp}
+
     except Exception as exc:
         logger.debug("Full extraction failed for %s: %s", ext, exc)
 
