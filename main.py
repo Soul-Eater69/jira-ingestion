@@ -79,7 +79,7 @@ async def ingest(
     from src.clients.jira.value_stream_client import JiraValueStreamClient
     from src.config import (
         JIRA_BASE_URL, JIRA_TOKEN, JIRA_VERIFY_SSL,
-        OPENAI_API_KEY, PINECONE_API_KEY,
+        OPENAI_API_KEY, INDEX_BACKEND,
     )
     from src.ingestion.pipeline import ingest_ticket
     from src.ingestion.indexing import create_indexes
@@ -98,8 +98,7 @@ async def ingest(
         except ImportError:
             logger.warning("openai package not installed — running without LLM/embeddings")
 
-    use_pinecone = bool(PINECONE_API_KEY)
-    coarse, fine, meta_idx, supervision = create_indexes(use_pinecone=use_pinecone)
+    coarse, fine, meta_idx, supervision = create_indexes(backend=INDEX_BACKEND)
 
     # Default storage dir to output/documents if not given via --output-file
     resolved_storage_dir = storage_dir or (

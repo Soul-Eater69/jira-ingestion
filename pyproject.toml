@@ -21,6 +21,9 @@ dependencies = [
     "langdetect>=1.0.9",
     # LLM + Embeddings
     "openai>=1.30.0",
+    # Vector store — LangGraph ecosystem
+    "langgraph>=0.2.0",
+    "langchain-core>=0.2.0",
     # Config
     "python-dotenv>=1.0.0",
 ]
@@ -28,10 +31,11 @@ dependencies = [
 [project.optional-dependencies]
 # Parquet output support
 parquet = ["pyarrow>=15.0.0"]
-# Pinecone vector index
-pinecone = ["pinecone-client>=3.0.0"]
+# Persistent vector store backends (pick one)
+chroma  = ["langchain-chroma>=0.1.0"]
+faiss   = ["faiss-cpu>=1.8.0"]
 # Everything
-all = ["jira-ingestion[parquet,pinecone]"]
+all = ["pyarrow>=15.0.0", "langchain-chroma>=0.1.0"]
 
 [project.scripts]
 jira-ingest = "main:main_cli"
@@ -50,8 +54,11 @@ include = [
 
 # ── For IDP-VALUE-STREAMS: add this block to the parent pyproject.toml ────────
 #
+# [tool.uv.workspace]
+# members = ["jira-ingestion"]
+#
 # [tool.uv.sources]
-# jira-ingestion = { path = "jira-ingestion", editable = true }
+# jira-ingestion = { workspace = true }
 #
 # [project.dependencies]
 # ...existing deps...

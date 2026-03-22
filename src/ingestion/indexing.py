@@ -1,15 +1,15 @@
 """
 Indexing design — Section 13 of the architecture spec.
 
-Implements three retrieval indexes + one supervision store:
+Three retrieval indexes + one supervision store:
   - Coarse index (deck-level, one entry per ticket)
   - Fine index (chunk-level)
   - Metadata index (BM25 keyword search)
   - Supervision store (ground-truth labels — isolated from retrieval)
 
-The VectorIndex and SupervisionStore classes are thin abstractions.
-The default implementation writes to Pinecone. Swap the backend by
-subclassing BaseVectorIndex / BaseSupervisonStore.
+Default backend: LangGraph InMemoryStore with cosine-similarity search.
+Swap to a persistent store (Chroma, FAISS, Azure AI Search, etc.) by
+passing a LangChain-compatible vector store to LangChainVectorIndex.
 """
 
 from __future__ import annotations
@@ -50,48 +50,136 @@ class BaseMetadataIndex(ABC):
 
 
 # ---------------------------------------------------------------------------
-# Pinecone implementation
+# LangGraph InMemoryStore implementation (default)
 # ---------------------------------------------------------------------------
 
-class PineconeVectorIndex(BaseVectorIndex):
-    """Wraps a Pinecone index for coarse or fine vector search."""
+class LangGraphVectorIndex(BaseVectorIndex):
+    """
+    Vector index backed by LangGraph's InMemoryStore.
 
-    def __init__(self, index_name: str) -> None:
-        self._index = self._init(index_name)
+    Documents are stored via the LangGraph store interface (namespace / key / value).
+    Pre-computed embedding vectors are kept separately for cosine-similarity search.
 
-    def _init(self, index_name: str) -> Any:
+    For production, replace with LangChainVectorIndex backed by Chroma, FAISS,
+    Azure AI Search, or any other LangChain-compatible vector store.
+    """
+
+    def __init__(self, namespace: str) -> None:
         try:
-            from pinecone import Pinecone  # type: ignore
-            from src.config import PINECONE_API_KEY, PINECONE_ENVIRONMENT
+            from langgraph.store.memory import InMemoryStore  # type: ignore
+            self._store = InMemoryStore()
+        except ImportError as exc:
+            raise ImportError(
+                "langgraph is required: pip install 'langgraph>=0.2.0'"
+            ) from exc
 
-            pc = Pinecone(api_key=PINECONE_API_KEY)
-            return pc.Index(index_name)
-        except Exception as exc:
-            logger.warning("Pinecone init failed (%s) — using in-memory fallback", exc)
-            return None
+        self._namespace = (namespace,)
+        self._vectors: dict[str, list[float]] = {}   # id → embedding vector
 
     def upsert(self, id: str, vector: list[float], metadata: dict, text: str) -> None:
-        if self._index is None:
-            return
-        meta = {**metadata, "_text": text[:4000]}  # Pinecone metadata value limit
-        try:
-            self._index.upsert(vectors=[{"id": id, "values": vector, "metadata": meta}])
-        except Exception as exc:
-            logger.error("Pinecone upsert failed for %s: %s", id, exc)
+        self._store.put(
+            self._namespace,
+            id,
+            {"text": text, "metadata": metadata},
+        )
+        if vector:
+            self._vectors[id] = vector
 
     def get(self, id: str) -> Optional[dict]:
-        if self._index is None:
+        item = self._store.get(self._namespace, id)
+        if item is None:
             return None
+        return {
+            "id": id,
+            "values": self._vectors.get(id, []),
+            **item.value,
+        }
+
+    def search(self, query_vector: list[float], top_k: int = 10) -> list[dict]:
+        """
+        Cosine-similarity search over stored vectors.
+        Returns top_k results sorted by descending similarity score.
+        """
+        if not self._vectors:
+            return []
+
         try:
-            result = self._index.fetch(ids=[id])
-            vectors = result.get("vectors", {})
-            return vectors.get(id)
-        except Exception:
-            return None
+            import numpy as np
+        except ImportError:
+            logger.warning("numpy not available — similarity search disabled")
+            return []
+
+        q = np.array(query_vector, dtype=float)
+        q_norm = q / (np.linalg.norm(q) + 1e-9)
+
+        scores: list[tuple[float, str]] = []
+        for doc_id, vec in self._vectors.items():
+            v = np.array(vec, dtype=float)
+            v_norm = v / (np.linalg.norm(v) + 1e-9)
+            scores.append((float(np.dot(q_norm, v_norm)), doc_id))
+
+        scores.sort(reverse=True)
+        results = []
+        for score, doc_id in scores[:top_k]:
+            doc = self.get(doc_id)
+            if doc:
+                results.append({**doc, "score": score})
+        return results
+
+    def __len__(self) -> int:
+        return len(self._vectors)
 
 
 # ---------------------------------------------------------------------------
-# In-memory implementation (for testing / local runs)
+# LangChain vector store adapter (swap-in for any persistent backend)
+# ---------------------------------------------------------------------------
+
+class LangChainVectorIndex(BaseVectorIndex):
+    """
+    Wraps any LangChain VectorStore as a pipeline index.
+
+    Accepts pre-computed embedding vectors via add_embeddings so the
+    pipeline's own embedding step is used rather than the store's.
+
+    Example — Chroma:
+        from langchain_chroma import Chroma
+        from langchain_core.embeddings import FakeEmbeddings
+        store = Chroma(
+            collection_name="tickets_coarse",
+            embedding_function=FakeEmbeddings(size=3072),
+            persist_directory="./chroma_db",
+        )
+        coarse_index = LangChainVectorIndex(store)
+
+    Example — FAISS:
+        from langchain_community.vectorstores import FAISS
+        from langchain_core.embeddings import FakeEmbeddings
+        store = FAISS.from_texts([], FakeEmbeddings(size=3072))
+        coarse_index = LangChainVectorIndex(store)
+    """
+
+    def __init__(self, store: Any) -> None:
+        self._store = store
+        self._data: dict[str, dict] = {}   # id → full record (for get())
+
+    def upsert(self, id: str, vector: list[float], metadata: dict, text: str) -> None:
+        try:
+            self._store.add_embeddings(
+                texts=[text],
+                embeddings=[vector],
+                metadatas=[{**metadata, "_id": id}],
+                ids=[id],
+            )
+        except Exception as exc:
+            logger.error("LangChain vector store upsert failed for %s: %s", id, exc)
+        self._data[id] = {"id": id, "values": vector, "metadata": metadata, "text": text}
+
+    def get(self, id: str) -> Optional[dict]:
+        return self._data.get(id)
+
+
+# ---------------------------------------------------------------------------
+# In-memory fallback (no external deps — for unit tests)
 # ---------------------------------------------------------------------------
 
 class InMemoryVectorIndex(BaseVectorIndex):
@@ -169,7 +257,7 @@ def index_retrieval_view(
     for chunk in all_chunks:
         embedding = chunk.get("embedding")
         if not embedding:
-            continue  # chunk was not embedded (e.g., boilerplate)
+            continue
         fine_meta = {
             "source": chunk.get("source", ""),
             "weight_multiplier": chunk.get("weight_multiplier", 1.0),
@@ -210,7 +298,7 @@ def index_supervision_view(
     supervision_store: BaseSupervisionStore,
 ) -> None:
     """
-    Index ground-truth labels and trainability flags in the supervision store.
+    Index ground-truth labels in the supervision store.
     This store is NEVER accessed during retrieval.
     """
     ticket_key = document["ticket_key"]
@@ -230,26 +318,48 @@ def index_supervision_view(
 
 
 # ---------------------------------------------------------------------------
-# Index factory — create the right backend based on config
+# Index factory
 # ---------------------------------------------------------------------------
 
-def create_indexes(use_pinecone: bool = False) -> tuple[
-    BaseVectorIndex, BaseVectorIndex, BaseMetadataIndex, BaseSupervisionStore
-]:
+def create_indexes(
+    backend: str = "langgraph",
+    langchain_stores: Optional[dict[str, Any]] = None,
+) -> tuple[BaseVectorIndex, BaseVectorIndex, BaseMetadataIndex, BaseSupervisionStore]:
     """
-    Factory function that returns (coarse, fine, metadata, supervision) indexes.
+    Factory that returns (coarse, fine, metadata, supervision) indexes.
 
-    Set use_pinecone=True when PINECONE_API_KEY is configured.
-    Falls back to in-memory for local development / testing.
+    Args:
+        backend: 'langgraph' (default) | 'langchain' | 'memory'
+        langchain_stores: Required when backend='langchain'.
+            {"coarse": <VectorStore>, "fine": <VectorStore>}
+
+    Examples:
+        # LangGraph in-memory (default, good for dev)
+        coarse, fine, meta, sup = create_indexes()
+
+        # LangChain Chroma (persistent)
+        from langchain_chroma import Chroma
+        from langchain_core.embeddings import FakeEmbeddings
+        stores = {
+            "coarse": Chroma("tickets_coarse", FakeEmbeddings(size=3072), persist_directory="./db"),
+            "fine":   Chroma("tickets_fine",   FakeEmbeddings(size=3072), persist_directory="./db"),
+        }
+        coarse, fine, meta, sup = create_indexes(backend="langchain", langchain_stores=stores)
     """
-    if use_pinecone:
-        from src.config import COARSE_INDEX_NAME, FINE_INDEX_NAME
-        coarse = PineconeVectorIndex(COARSE_INDEX_NAME)
-        fine = PineconeVectorIndex(FINE_INDEX_NAME)
-    else:
+    if backend == "langgraph":
+        coarse = LangGraphVectorIndex("tickets_coarse")
+        fine   = LangGraphVectorIndex("tickets_fine")
+
+    elif backend == "langchain":
+        if not langchain_stores:
+            raise ValueError("langchain_stores must be provided when backend='langchain'")
+        coarse = LangChainVectorIndex(langchain_stores["coarse"])
+        fine   = LangChainVectorIndex(langchain_stores["fine"])
+
+    else:  # "memory" — unit tests / CI
         coarse = InMemoryVectorIndex()
-        fine = InMemoryVectorIndex()
+        fine   = InMemoryVectorIndex()
 
-    metadata = InMemoryMetadataIndex()
+    metadata   = InMemoryMetadataIndex()
     supervision = InMemorySupervisionStore()
     return coarse, fine, metadata, supervision

@@ -19,8 +19,8 @@ EMBEDDING_MODEL: str = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-large
 COARSE_INDEX_NAME: str = os.environ.get("COARSE_INDEX_NAME", "tickets_coarse")
 FINE_INDEX_NAME: str = os.environ.get("FINE_INDEX_NAME", "tickets_fine")
 SUPERVISION_STORE: str = os.environ.get("SUPERVISION_STORE", "tickets_supervision")
-PINECONE_API_KEY: str = os.environ.get("PINECONE_API_KEY", "")
-PINECONE_ENVIRONMENT: str = os.environ.get("PINECONE_ENVIRONMENT", "us-east-1")
+# INDEX_BACKEND: 'langgraph' (default) | 'langchain' | 'memory'
+INDEX_BACKEND: str = os.environ.get("INDEX_BACKEND", "langgraph")
 
 # --- Entity dictionaries ---
 ENTITY_DICT_PATH: str = os.environ.get("ENTITY_DICT_PATH", "data/entity_dicts/")

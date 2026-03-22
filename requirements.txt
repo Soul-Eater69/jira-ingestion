@@ -6,10 +6,9 @@ aiofiles>=23.0.0
 jira>=3.6.0
 
 # Document extraction — MarkItDown handles PPTX, PDF, DOCX, images, etc.
-# The [all] extra pulls in python-pptx, pdfminer, python-docx, etc. automatically.
 markitdown[all]>=0.0.1
 
-# PDF page metadata peek (used in triage cheap_peek only — optional)
+# PDF page metadata peek (triage cheap_peek — optional)
 PyMuPDF>=1.23.0
 
 # Text processing
@@ -18,11 +17,16 @@ langdetect>=1.0.9
 # LLM / Embeddings
 openai>=1.30.0
 
-# Data / Utils
-python-dotenv>=1.0.0
+# Vector store — LangGraph ecosystem
+langgraph>=0.2.0
+langchain-core>=0.2.0
+
+# Persistent vector store backends (optional — pick one)
+# langchain-chroma>=0.1.0
+# faiss-cpu>=1.8.0
 
 # Parquet output (optional — only needed for --fmt parquet)
 pyarrow>=15.0.0
 
-# Vector index (Pinecone — swap for your preferred provider)
-pinecone-client>=3.0.0
+# Config
+python-dotenv>=1.0.0
