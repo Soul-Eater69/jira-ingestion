@@ -1,0 +1,88 @@
+# ============================================================================
+# IDP-VALUE-STREAMS — root pyproject.toml
+#
+# INSTRUCTIONS:
+#   1. Copy this file to: IDP-VALUE-STREAMS/pyproject.toml
+#   2. Merge any deps that already exist in your current pyproject.toml
+#   3. From the IDP-VALUE-STREAMS root run:  uv sync
+#      → installs root project + jira-ingestion workspace member in one shot
+#
+# How the workspace works:
+#   - [tool.uv.workspace] members lists every local sub-package folder
+#   - uv treats each member as an editable install automatically
+#   - All packages share one virtual environment (.venv at root)
+#   - Imports work across all members without any sys.path hacks
+# ============================================================================
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "idp-value-streams"
+version = "0.1.0"
+description = "Intelligent Document Processing — Value Stream prediction system"
+requires-python = ">=3.10"
+dependencies = [
+    # ── Workspace members (installed as editable automatically) ──────────────
+    "jira-ingestion",          # ./jira-ingestion/
+
+    # ── Async / HTTP ─────────────────────────────────────────────────────────
+    "aiohttp>=3.9.0",
+    "aiofiles>=23.0.0",
+
+    # ── Azure clients ─────────────────────────────────────────────────────────
+    "azure-search-documents>=11.4.0",
+    "azure-identity>=1.15.0",
+    "azure-storage-blob>=12.19.0",
+
+    # ── LLM / Embeddings ─────────────────────────────────────────────────────
+    "openai>=1.30.0",
+
+    # ── Graph DB ──────────────────────────────────────────────────────────────
+    "neo4j>=5.17.0",
+
+    # ── Document extraction (markitdown covers pptx/pdf/docx) ────────────────
+    "markitdown[all]>=0.0.1",
+    "PyMuPDF>=1.23.0",
+
+    # ── Jira ─────────────────────────────────────────────────────────────────
+    "jira>=3.6.0",
+
+    # ── Data / Utils ──────────────────────────────────────────────────────────
+    "python-dotenv>=1.0.0",
+    "langdetect>=1.0.9",
+    "pyarrow>=15.0.0",
+    "pydantic>=2.6.0",
+    "tenacity>=8.2.0",          # retry logic
+
+    # ── Dev / Test ────────────────────────────────────────────────────────────
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+# ── uv workspace — add new local sub-packages here ───────────────────────────
+[tool.uv.workspace]
+members = [
+    "jira-ingestion",
+    # "another-subpackage",   ← add future sub-packages here
+]
+
+# ── Source overrides — workspace members resolve locally ─────────────────────
+[tool.uv.sources]
+jira-ingestion = { workspace = true }
+
+# ── Package discovery — tells hatchling where each package's src lives ────────
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+# ── Pytest ────────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests", "jira-ingestion/tests"]
+pythonpath = ["src", "jira-ingestion/src"]
+
+# ── Ruff (optional linter) ────────────────────────────────────────────────────
+[tool.ruff]
+line-length = 100
+target-version = "py310"
