@@ -142,7 +142,7 @@ def assemble_document(
     Returns:
         Unified document dict matching the schema in Section 12.
     """
-    from src.config import JiraIngestionConfig
+    from jira_ingestion.config import JiraIngestionConfig
     from .metadata import extract_metadata, classify_links
     from .triage import triage_attachments
     from .description import classify_description, build_description_chunks

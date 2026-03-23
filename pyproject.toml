@@ -34,11 +34,11 @@ faiss   = ["faiss-cpu>=1.8.0"]
 all = ["pyarrow>=15.0.0", "langchain-chroma>=0.1.0"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src"]
+packages = ["jira_ingestion"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "src/",
+    "jira_ingestion/",
     "data/entity_dicts/",
 ]
 

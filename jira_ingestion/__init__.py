@@ -12,10 +12,10 @@ Public API:
     )
 """
 
-from src.config import JiraIngestionConfig
-from src.clients.jira.value_stream_client import JiraValueStreamClient
-from src.ingestion.pipeline import assemble_document, ingest_ticket
-from src.ingestion.indexing import (
+from jira_ingestion.config import JiraIngestionConfig
+from jira_ingestion.clients.jira.value_stream_client import JiraValueStreamClient
+from jira_ingestion.ingestion.pipeline import assemble_document, ingest_ticket
+from jira_ingestion.ingestion.indexing import (
     create_indexes,
     LangGraphVectorIndex,
     LangChainVectorIndex,

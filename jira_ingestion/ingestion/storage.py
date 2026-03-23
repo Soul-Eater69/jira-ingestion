@@ -7,7 +7,7 @@ Supported formats:
     Parquet    — columnar, compact, good for bulk analysis (requires pyarrow)
 
 Usage:
-    from src.ingestion.storage import DocumentStore
+    from jira_ingestion.ingestion.storage import DocumentStore
 
     store = DocumentStore(output_dir="output/documents")
     store.save(document)                          # → output/documents/IDEA-1234.json
