@@ -16,35 +16,42 @@ from typing import Any, Dict, List
 
 import httpx
 
-from .jira_client import JIRARestClient
-from .value_stream_protocol import ValueStreamFetcher
-
 logger = logging.getLogger(__name__)
 
 
-class JiraValueStreamClient(ValueStreamFetcher):
+class JiraValueStreamClient:
     """Async Jira client that exposes ticket data and attachment text extraction."""
 
     def __init__(self, base_url: str, token: str, verify_ssl: bool = False) -> None:
-        self.base_url = base_url
+        self.base_url = base_url.rstrip("/")
         self.token = token
         self.verify_ssl = verify_ssl
-        self.client = JIRARestClient(
-            base_url=base_url,
-            auth_token=token,
-            api_token=token,
-            verify_ssl=verify_ssl,
-        )
+        self._client: httpx.AsyncClient | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     async def authenticate(self) -> None:
-        await self.client._authenticate()
+        """Create an authenticated httpx client and verify credentials."""
+        self._client = httpx.AsyncClient(
+            verify=self.verify_ssl,
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            timeout=60.0,
+        )
+        response = await self._client.get(f"{self.base_url}/rest/api/2/myself")
+        response.raise_for_status()
+        me = response.json()
+        logger.info("Authenticated as %s", me.get("displayName", me.get("name")))
 
     async def close(self) -> None:
-        await self.client.close()
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+            self._client = None
 
     async def __aenter__(self) -> "JiraValueStreamClient":
         await self.authenticate()
@@ -63,9 +70,13 @@ class JiraValueStreamClient(ValueStreamFetcher):
           - attachments: list of attachment metadata dicts
           - themes:      list of linked issues (key, summary, status)
         """
-        issue = await self.client.get_issue_by_key(
-            ticket_id, fields=["attachment", "issuelinks"]
-        )
+        if self._client is None:
+            raise RuntimeError("Call authenticate() first.")
+        url = f"{self.base_url}/rest/api/2/issue/{ticket_id}"
+        params = {"fields": "attachment,issuelinks"}
+        response = await self._client.get(url, params=params)
+        response.raise_for_status()
+        issue = response.json()
         fields = issue.get("fields", {})
 
         attachments = issue.get("fields", {}).get("attachment", [])
