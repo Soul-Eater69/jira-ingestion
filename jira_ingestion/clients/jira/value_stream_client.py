@@ -12,9 +12,9 @@ from __future__ import annotations
 
 import io
 import logging
-from typing import Any, Optional
+from typing import Any, Dict, List
 
-import aiohttp
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -22,45 +22,36 @@ logger = logging.getLogger(__name__)
 class JiraValueStreamClient:
     """Async Jira client that exposes ticket data and attachment text extraction."""
 
-    def __init__(self, base_url: str, token: str, verify_ssl: bool = True) -> None:
+    def __init__(self, base_url: str, token: str, verify_ssl: bool = False) -> None:
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.verify_ssl = verify_ssl
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._client: httpx.AsyncClient | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     async def authenticate(self) -> None:
-        """Create an authenticated aiohttp session and verify credentials."""
-        connector = aiohttp.TCPConnector(ssl=self.verify_ssl)
-        self._session = aiohttp.ClientSession(
-            connector=connector,
+        """Create an authenticated httpx client and verify credentials."""
+        self._client = httpx.AsyncClient(
+            verify=self.verify_ssl,
             headers={
                 "Authorization": f"Bearer {self.token}",
                 "Accept": "application/json",
                 "Content-Type": "application/json",
             },
+            timeout=60.0,
         )
-        # Verify credentials by hitting the /myself endpoint
-        try:
-            async with self._session.get(
-                f"{self.base_url}/rest/api/2/myself"
-            ) as resp:
-                resp.raise_for_status()
-                me = await resp.json()
-                logger.info("Authenticated as %s", me.get("displayName", me.get("name")))
-        except aiohttp.ClientResponseError as exc:
-            await self.close()
-            raise RuntimeError(
-                f"Jira authentication failed ({exc.status}): {exc.message}"
-            ) from exc
+        response = await self._client.get(f"{self.base_url}/rest/api/2/myself")
+        response.raise_for_status()
+        me = response.json()
+        logger.info("Authenticated as %s", me.get("displayName", me.get("name")))
 
     async def close(self) -> None:
-        if self._session and not self._session.closed:
-            await self._session.close()
-            self._session = None
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+            self._client = None
 
     async def __aenter__(self) -> "JiraValueStreamClient":
         await self.authenticate()
@@ -73,144 +64,166 @@ class JiraValueStreamClient:
     # Core API calls
     # ------------------------------------------------------------------
 
-    async def get_ticket_data(self, ticket_id: str) -> dict:
+    async def get_ticket_data(self, ticket_id: str) -> Dict[str, Any]:
         """
         Fetch a Jira ticket and return structured data with:
-          - themes:      list of linked issues (key, summary, status, link_type)
           - attachments: list of attachment metadata dicts
-          - fields:      raw Jira fields for downstream processing
+          - themes:      list of linked issues (key, summary, status)
         """
-        if self._session is None:
+        if self._client is None:
             raise RuntimeError("Call authenticate() first.")
-
         url = f"{self.base_url}/rest/api/2/issue/{ticket_id}"
-        params = {"expand": "attachment,issuelinks,comment,renderedFields"}
+        params = {"fields": "attachment,issuelinks"}
+        response = await self._client.get(url, params=params)
+        response.raise_for_status()
+        issue = response.json()
+        fields = issue.get("fields", {})
 
-        async with self._session.get(url, params=params) as resp:
-            resp.raise_for_status()
-            raw = await resp.json()
+        attachments = issue.get("fields", {}).get("attachment", [])
 
-        fields = raw.get("fields", {})
+        # -- Themes: linked issues filtered by "implements" relationship --
+        themes: List[Dict[str, Any]] = []
+        issuelinks = issue.get("fields", {}).get("issuelinks", [])
+        for link in issuelinks:
+            if (
+                link.get("type", {}).get("outward") == "implements"
+                and "outwardIssue" in link
+            ):
+                fields_data = link["outwardIssue"].get("fields", {})
+                summary = fields_data.get("summary")
+                key = link["outwardIssue"].get("key")
+                status = fields_data.get("status", {}).get("name")
+                themes.append({"key": key, "summary": summary, "status": status})
 
-        # -- Themes: all linked issues (VS links, related ideas, etc.) --
-        themes: list[dict] = []
-        for link in fields.get("issuelinks", []):
-            linked = link.get("outwardIssue") or link.get("inwardIssue")
-            if not linked:
-                continue
-            themes.append(
-                {
-                    "key": linked["key"],
-                    "summary": linked["fields"].get("summary", ""),
-                    "status": linked["fields"].get("status", {}).get("name", ""),
-                    "link_type": link.get("type", {}).get("name", ""),
-                    "direction": "outward" if link.get("outwardIssue") else "inward",
-                }
-            )
+            if (
+                link.get("type", {}).get("inward") == "implemented by"
+                and "inwardIssue" in link
+            ):
+                fields_data = link["inwardIssue"].get("fields", {})
+                summary = fields_data.get("summary")
+                key = link["inwardIssue"].get("key")
+                status = fields_data.get("status", {}).get("name")
+                themes.append({"key": key, "summary": summary, "status": status})
 
-        # -- Attachments: Jira metadata (no download yet) --
-        attachments: list[dict] = []
-        reporter_name = (fields.get("reporter") or {}).get("displayName", "")
-        for att in fields.get("attachment", []):
-            attachments.append(
-                {
-                    "id": att["id"],
-                    "filename": att["filename"],
-                    "mimeType": att.get("mimeType", ""),
-                    "size": att.get("size", 0),
-                    "content": att["content"],  # download URL
-                    "created": att.get("created", ""),
-                    "author": (att.get("author") or {}).get("displayName", ""),
-                    "is_reporter_upload": (
-                        (att.get("author") or {}).get("displayName", "") == reporter_name
-                    ),
-                }
-            )
+        return {"attachments": attachments, "themes": themes, "fields": fields}
 
-        return {
-            "key": raw["key"],
-            "themes": themes,
-            "attachments": attachments,
-            "fields": fields,  # raw fields for full pipeline use
-        }
+    # ------------------------------------------------------------------
+    # Attachment handling
+    # ------------------------------------------------------------------
 
-    async def fetch_attachment_content(self, attachments: list[dict]) -> list[dict]:
+    async def download_attachment(self, url_or_att: Any, dest_path: str = "") -> Any:
         """
-        Download each attachment and extract its text via MarkItDown.
+        Download a single attachment.
 
-        Returns a list of dicts:
-            {"filename": str, "mime_type": str, "text_content": str, "error": str|None}
+        Supports two calling conventions:
+          - download_attachment(url: str, dest_path: str) — saves to disk
+          - download_attachment(att: dict) — returns raw bytes (pipeline compat)
         """
-        # Import here so the rest of the module works even if markitdown isn't installed
+        headers = {"Authorization": f"Bearer {self.token}"}
+        if isinstance(url_or_att, dict):
+            url = url_or_att.get("content", "")
+        else:
+            url = url_or_att
+
+        async with httpx.AsyncClient(verify=self.verify_ssl) as client:
+            response = await client.get(url, headers=headers, timeout=60.0)
+            response.raise_for_status()
+
+        if dest_path:
+            with open(dest_path, "wb") as f:
+                f.write(response.content)
+        else:
+            return response.content
+
+    async def fetch_attachment_content(
+        self,
+        attachments: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Download each attachment and extract its text content using MarkItDown.
+
+        Args:
+            attachments: List of attachment dicts from get_ticket_data().
+                Each dict should have at least 'content' (URL),
+                'filename', and optionally 'mimeType'.
+
+        Returns:
+            List of dicts with keys:
+                - filename:     original attachment filename
+                - mime_type:    MIME type reported by Jira
+                - text_content: extracted Markdown text (empty string on failure)
+                - error:        error message if extraction failed, else None
+        """
         try:
             from markitdown import MarkItDown  # type: ignore
+
             md = MarkItDown()
         except ImportError:
             logger.warning("markitdown not installed; attachment text extraction disabled.")
             md = None
 
-        results: list[dict] = []
-        for att in attachments:
-            url = att.get("content", "")
-            filename = att.get("filename", "")
-            mime_type = att.get("mimeType", "")
+        headers = {"Authorization": f"Bearer {self.token}"}
+        results: List[Dict[str, Any]] = []
 
-            if not url:
-                results.append({
-                    "filename": filename,
-                    "mime_type": mime_type,
-                    "text_content": "",
-                    "error": "No content URL",
-                })
-                continue
+        async with httpx.AsyncClient(verify=self.verify_ssl) as client:
+            for att in attachments:
+                url = att.get("content", "")
+                filename = att.get("filename", "")
+                mime_type = att.get("mimeType", "")
 
-            try:
-                file_bytes = await self._download_file(url)
-                if md is None:
-                    raise ImportError("markitdown not available")
-                text = self._markitdown_extract(md, file_bytes, filename, mime_type)
-                results.append({"filename": filename, "mime_type": mime_type, "text_content": text, "error": None})
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to extract %s: %s", filename, exc)
-                results.append({"filename": filename, "mime_type": mime_type, "text_content": "", "error": str(exc)})
+                if not url:
+                    results.append({
+                        "filename": filename,
+                        "mime_type": mime_type,
+                        "text_content": "",
+                        "error": "No content URL",
+                    })
+                    continue
+
+                try:
+                    response = await client.get(url, headers=headers, timeout=60.0)
+                    response.raise_for_status()
+
+                    # Determine file extension for better format detection
+                    ext = f".{filename.rsplit('.', 1)[-1]}" if "." in filename else ""
+                    stream_info = self._build_stream_info(
+                        mime_type=mime_type, ext=ext, filename=filename
+                    )
+
+                    result = md.convert_stream(
+                        io.BytesIO(response.content),
+                        stream_info=stream_info,
+                    )
+
+                    results.append({
+                        "filename": filename,
+                        "mime_type": mime_type,
+                        "text_content": result.text_content,
+                        "error": None,
+                    })
+                except Exception as exc:
+                    results.append({
+                        "filename": filename,
+                        "mime_type": mime_type,
+                        "text_content": "",
+                        "error": str(exc),
+                    })
 
         return results
 
     # ------------------------------------------------------------------
-    # Low-level helpers
+    # Helpers
     # ------------------------------------------------------------------
-
-    async def _download_file(self, url: str) -> bytes:
-        """Download a file and return its raw bytes."""
-        if self._session is None:
-            raise RuntimeError("Call authenticate() first.")
-        async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=60.0)) as resp:
-            resp.raise_for_status()
-            return await resp.read()
 
     @staticmethod
-    def _markitdown_extract(md: Any, file_bytes: bytes, filename: str, mime_type: str = "") -> str:
-        """Convert file bytes to Markdown text via MarkItDown."""
-        try:
-            from markitdown import StreamInfo  # type: ignore
-            ext = f".{filename.rsplit('.', 1)[-1]}" if "." in filename else ""
-            stream_info = StreamInfo(
-                mimetype=mime_type or None,
-                extension=ext or None,
-                filename=filename or None,
-            )
-            result = md.convert_stream(io.BytesIO(file_bytes), stream_info=stream_info)
-        except ImportError:
-            # Fallback for older markitdown versions without StreamInfo
-            stream = io.BytesIO(file_bytes)
-            stream.name = filename
-            result = md.convert_stream(stream)
-        return result.text_content or ""
+    def _build_stream_info(
+        mime_type: str, ext: str, filename: str
+    ) -> Any:
+        """Build a MarkItDown StreamInfo for format detection."""
+        from markitdown import StreamInfo  # type: ignore
 
-    # ------------------------------------------------------------------
-    # Convenience: download raw bytes for structured extraction
-    # ------------------------------------------------------------------
-
-    async def download_attachment(self, attachment: dict) -> bytes:
-        """Download a single attachment and return its raw bytes."""
-        return await self._download_file(attachment["content"])
+        return StreamInfo(
+            mimetype=mime_type or None,
+            extension=ext or None,
+            filename=filename or None,
+        )
