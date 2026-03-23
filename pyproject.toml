@@ -24,8 +24,6 @@ dependencies = [
     # Vector store — LangGraph ecosystem
     "langgraph>=0.2.0",
     "langchain-core>=0.2.0",
-    # Config
-    "python-dotenv>=1.0.0",
 ]
 
 [project.optional-dependencies]
@@ -37,9 +35,6 @@ faiss   = ["faiss-cpu>=1.8.0"]
 # Everything
 all = ["pyarrow>=15.0.0", "langchain-chroma>=0.1.0"]
 
-[project.scripts]
-jira-ingest = "main:main_cli"
-
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
 
@@ -47,9 +42,6 @@ packages = ["src"]
 include = [
     "src/",
     "data/entity_dicts/",
-    "integration/",
-    "requirements.txt",
-    ".env.example",
 ]
 
 # ── For IDP-VALUE-STREAMS: add this block to the parent pyproject.toml ────────

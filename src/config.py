@@ -1,52 +1,51 @@
-import os
-from dotenv import load_dotenv
+"""
+Pipeline configuration — passed explicitly by the caller, no env loading.
 
-load_dotenv()
+Usage:
+    from jira_ingestion import JiraIngestionConfig
 
-# --- Jira ---
-JIRA_BASE_URL: str = os.environ.get("JIRA_BASE_URL", "https://jira.fyiblue.com")
-JIRA_TOKEN: str = os.environ.get("JIRA_API_TOKEN", "")
-JIRA_VERIFY_SSL: bool = os.environ.get("JIRA_VERIFY_SSL", "true").lower() == "true"
+    config = JiraIngestionConfig()                     # all defaults
+    config = JiraIngestionConfig(max_slides=40, ocr_enabled=False)
+"""
 
-# --- LLM ---
-LLM_MODEL: str = os.environ.get("LLM_MODEL", "gpt-4o-mini")
-OPENAI_API_KEY: str = os.environ.get("OPENAI_API_KEY", "")
+from __future__ import annotations
 
-# --- Embeddings ---
-EMBEDDING_MODEL: str = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-large")
+from dataclasses import dataclass, field
 
-# --- Indexes ---
-COARSE_INDEX_NAME: str = os.environ.get("COARSE_INDEX_NAME", "tickets_coarse")
-FINE_INDEX_NAME: str = os.environ.get("FINE_INDEX_NAME", "tickets_fine")
-SUPERVISION_STORE: str = os.environ.get("SUPERVISION_STORE", "tickets_supervision")
-# INDEX_BACKEND: 'langgraph' (default) | 'langchain' | 'memory'
-INDEX_BACKEND: str = os.environ.get("INDEX_BACKEND", "langgraph")
 
-# --- Entity dictionaries ---
-ENTITY_DICT_PATH: str = os.environ.get("ENTITY_DICT_PATH", "data/entity_dicts/")
-ENTITY_DICT_REFRESH: str = os.environ.get("ENTITY_DICT_REFRESH", "daily")
+@dataclass
+class JiraIngestionConfig:
+    # --- Extraction limits ---
+    max_slides: int = 60
+    max_supplementary: int = 2
+    ocr_enabled: bool = True
+    section_min_slides: int = 8
 
-# --- Extraction ---
-OCR_ENABLED: bool = os.environ.get("OCR_ENABLED", "true").lower() == "true"
-MAX_SLIDES: int = int(os.environ.get("MAX_SLIDES", "60"))
-MAX_SUPPLEMENTARY: int = int(os.environ.get("MAX_SUPPLEMENTARY", "2"))
-TABLE_SUMMARY_CACHE_TTL: int = int(os.environ.get("TABLE_SUMMARY_CACHE_TTL_SECONDS", str(7 * 24 * 3600)))
+    # --- Embedding / LLM ---
+    embedding_model: str = "text-embedding-3-large"
+    llm_model: str = "gpt-4o-mini"
 
-# --- Triage thresholds ---
-MIN_FILE_SIZE_BYTES: int = 15_000
-MIN_PDF_SIZE_BYTES: int = 50_000
-MAX_FILE_SIZE_BYTES: int = 100_000_000
-LAYER1_SKIP_PEEK_SCORE: int = 60
-LAYER1_SKIP_PEEK_GAP: int = 20
+    # --- Entity dictionaries ---
+    entity_dict_path: str = "data/entity_dicts"
 
-# --- Description thresholds ---
-DESC_JUNK_MAX_WORDS: int = 10
-DESC_THIN_MAX_WORDS: int = 50
-DESC_RICH_MIN_WORDS: int = 150
+    # --- Triage thresholds ---
+    min_file_size_bytes: int = 15_000
+    min_pdf_size_bytes: int = 50_000
+    max_file_size_bytes: int = 100_000_000
+    layer1_skip_peek_score: int = 60
+    layer1_skip_peek_gap: int = 20
 
-# --- Section chunking ---
-SECTION_MIN_SLIDES: int = 8
+    # --- Description thresholds ---
+    desc_junk_max_words: int = 10
+    desc_thin_max_words: int = 50
+    desc_rich_min_words: int = 150
 
-# --- Entity extraction ---
-ENTITY_CONFIDENCE_TEXT_MATCH: float = 0.8
-ENTITY_CONFIDENCE_COMPONENT_MATCH: float = 1.0
+    # --- Section chunking ---
+    # (alias for section_min_slides — kept for backwards compat)
+
+    # --- Entity extraction ---
+    entity_confidence_text_match: float = 0.8
+    entity_confidence_component_match: float = 1.0
+
+    # --- Table summary cache ---
+    table_summary_cache_ttl: int = 7 * 24 * 3600

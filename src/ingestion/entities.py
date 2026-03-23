@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from pathlib import Path
 from typing import Any, Optional
@@ -33,7 +32,7 @@ def load_entity_dictionaries(dict_path: Optional[str] = None) -> dict[str, dict[
     from lowercase alias/canonical → canonical name.
     """
     if dict_path is None:
-        dict_path = os.environ.get("ENTITY_DICT_PATH", "data/entity_dicts/")
+        dict_path = "data/entity_dicts"
 
     base = Path(dict_path)
     lookups: dict[str, dict[str, str]] = {t: {} for t in ENTITY_TYPES}
@@ -186,7 +185,7 @@ def sync_entity_dictionaries(
         dict_path:  Output directory for JSON files.
     """
     if dict_path is None:
-        dict_path = os.environ.get("ENTITY_DICT_PATH", "data/entity_dicts/")
+        dict_path = "data/entity_dicts"
 
     base = Path(dict_path)
     base.mkdir(parents=True, exist_ok=True)
@@ -251,7 +250,7 @@ def ensure_default_dictionaries(dict_path: Optional[str] = None) -> None:
     This prevents errors on first run before graph DB sync.
     """
     if dict_path is None:
-        dict_path = os.environ.get("ENTITY_DICT_PATH", "data/entity_dicts/")
+        dict_path = "data/entity_dicts"
 
     base = Path(dict_path)
     base.mkdir(parents=True, exist_ok=True)

@@ -33,6 +33,7 @@ async def ingest_ticket(
     force_reprocess: bool = False,
     storage_dir: Optional[str] = None,
     storage_fmt: str = "json",
+    config: Optional[Any] = None,
 ) -> dict:
     """
     Fetch, process, and index a single Jira ticket.
@@ -52,6 +53,7 @@ async def ingest_ticket(
         storage_dir:       If set, persist the assembled document here before
                            indexing. Accepts a directory path.
         storage_fmt:       'json' | 'jsonl' | 'parquet' (default 'json').
+        config:            JiraIngestionConfig instance (uses defaults if None).
     """
     # Idempotency check
     if not force_reprocess:
@@ -81,6 +83,7 @@ async def ingest_ticket(
         llm_client=llm_client,
         embedding_client=embedding_client,
         dict_path=dict_path,
+        config=config,
     )
 
     # Persist to disk before indexing (optional)
@@ -120,6 +123,7 @@ def assemble_document(
     llm_client: Optional[Any] = None,
     embedding_client: Optional[Any] = None,
     dict_path: Optional[str] = None,
+    config: Optional[Any] = None,
 ) -> dict:
     """
     Assemble a unified document from raw ticket data.
@@ -133,11 +137,12 @@ def assemble_document(
         llm_client:        OpenAI-compatible client for summaries (optional)
         embedding_client:  OpenAI-compatible client for embeddings (optional)
         dict_path:         Path to entity dictionary JSON files.
+        config:            JiraIngestionConfig instance (uses defaults if None).
 
     Returns:
         Unified document dict matching the schema in Section 12.
     """
-    from src.config import SECTION_MIN_SLIDES
+    from src.config import JiraIngestionConfig
     from .metadata import extract_metadata, classify_links
     from .triage import triage_attachments
     from .description import classify_description, build_description_chunks
@@ -146,6 +151,9 @@ def assemble_document(
     from .summary import generate_summary
     from .entities import extract_entities, load_entity_dictionaries, ensure_default_dictionaries
     from .embedding import embed_batch
+
+    cfg = config if config is not None else JiraIngestionConfig()
+    resolved_dict_path = dict_path or cfg.entity_dict_path
 
     ticket_key: str = ticket_data["key"]
     fields: dict = ticket_data.get("fields", {})
@@ -182,15 +190,13 @@ def assemble_document(
         content_source = ext if ext in ("pptx", "ppt", "pdf", "docx", "doc") else None
         file_bytes = primary.get("file_bytes") or _safe_download(download_fn, primary)
         if file_bytes and content_source:
-            result = _extract_primary(file_bytes, ext)
+            result = _extract_primary(file_bytes, ext, cfg)
             chunks.extend(result.get("chunks", []))
 
     # ------------------------------------------------------------------
-    # 5. Supplementary attachments (up to MAX_SUPPLEMENTARY)
+    # 5. Supplementary attachments (up to config.max_supplementary)
     # ------------------------------------------------------------------
-    from src.config import MAX_SUPPLEMENTARY
-
-    for supp in supplementary[:MAX_SUPPLEMENTARY]:
+    for supp in supplementary[:cfg.max_supplementary]:
         if download_fn is None:
             break
         supp_bytes = _safe_download(download_fn, supp)
@@ -233,7 +239,7 @@ def assemble_document(
     # ------------------------------------------------------------------
     slide_chunks = [c for c in chunks if c["source"] in ("pptx_slide", "pdf_page")]
     section_chunks: list[dict] = []
-    if len(slide_chunks) >= SECTION_MIN_SLIDES:
+    if len(slide_chunks) >= cfg.section_min_slides:
         section_chunks = build_section_chunks(slide_chunks)
 
     # ------------------------------------------------------------------
@@ -250,8 +256,8 @@ def assemble_document(
     # ------------------------------------------------------------------
     # 11. [v2] Entity extraction
     # ------------------------------------------------------------------
-    ensure_default_dictionaries(dict_path)
-    dictionaries = load_entity_dictionaries(dict_path)
+    ensure_default_dictionaries(resolved_dict_path)
+    dictionaries = load_entity_dictionaries(resolved_dict_path)
     entity_mentions = extract_entities(chunks, meta, dictionaries)
 
     # ------------------------------------------------------------------
@@ -264,7 +270,7 @@ def assemble_document(
 
     embeddings: list[list[float]] = []
     if embedding_client is not None:
-        embeddings = embed_batch(texts_to_embed, embedding_client)
+        embeddings = embed_batch(texts_to_embed, embedding_client, model=cfg.embedding_model)
     else:
         logger.warning("No embedding client provided — embeddings will be empty lists")
         embeddings = [[] for _ in texts_to_embed]
@@ -359,18 +365,16 @@ def assemble_document(
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _extract_primary(file_bytes: bytes, ext: str) -> dict:
+def _extract_primary(file_bytes: bytes, ext: str, config: Any) -> dict:
     """Run structured extraction on the primary attachment."""
-    from src.config import MAX_SLIDES, OCR_ENABLED
-
     try:
         if ext in ("pptx", "ppt"):
             from .extraction.pptx import extract_pptx
-            return extract_pptx(file_bytes, max_slides=MAX_SLIDES)
+            return extract_pptx(file_bytes, max_slides=config.max_slides)
 
         elif ext == "pdf":
             from .extraction.pdf import extract_pdf
-            return extract_pdf(file_bytes, ocr_enabled=OCR_ENABLED, max_pages=MAX_SLIDES)
+            return extract_pdf(file_bytes, ocr_enabled=config.ocr_enabled, max_pages=config.max_slides)
 
         elif ext in ("docx", "doc"):
             from .extraction.docx import extract_docx

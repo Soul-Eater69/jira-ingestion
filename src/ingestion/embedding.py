@@ -33,9 +33,7 @@ def embed_batch(
     Returns:
         List of embedding vectors (same length as input texts).
     """
-    from src.config import EMBEDDING_MODEL
-
-    model = model or EMBEDDING_MODEL
+    model = model or "text-embedding-3-large"
     all_embeddings: list[list[float]] = []
 
     num_batches = math.ceil(len(texts) / batch_size)
