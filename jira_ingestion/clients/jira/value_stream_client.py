@@ -139,7 +139,7 @@ class JiraValueStreamClient:
         Download each attachment and extract its text via MarkItDown.
 
         Returns a list of dicts:
-            {"filename": str, "error": str|None, "text_content": str|None}
+            {"filename": str, "mime_type": str, "text_content": str, "error": str|None}
         """
         # Import here so the rest of the module works even if markitdown isn't installed
         try:
@@ -151,16 +151,28 @@ class JiraValueStreamClient:
 
         results: list[dict] = []
         for att in attachments:
-            filename = att.get("filename", "unknown")
+            url = att.get("content", "")
+            filename = att.get("filename", "")
+            mime_type = att.get("mimeType", "")
+
+            if not url:
+                results.append({
+                    "filename": filename,
+                    "mime_type": mime_type,
+                    "text_content": "",
+                    "error": "No content URL",
+                })
+                continue
+
             try:
-                file_bytes = await self._download_file(att["content"])
+                file_bytes = await self._download_file(url)
                 if md is None:
                     raise ImportError("markitdown not available")
-                text = self._markitdown_extract(md, file_bytes, filename)
-                results.append({"filename": filename, "error": None, "text_content": text})
+                text = self._markitdown_extract(md, file_bytes, filename, mime_type)
+                results.append({"filename": filename, "mime_type": mime_type, "text_content": text, "error": None})
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to extract %s: %s", filename, exc)
-                results.append({"filename": filename, "error": str(exc), "text_content": None})
+                results.append({"filename": filename, "mime_type": mime_type, "text_content": "", "error": str(exc)})
 
         return results
 
@@ -172,16 +184,27 @@ class JiraValueStreamClient:
         """Download a file and return its raw bytes."""
         if self._session is None:
             raise RuntimeError("Call authenticate() first.")
-        async with self._session.get(url) as resp:
+        async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=60.0)) as resp:
             resp.raise_for_status()
             return await resp.read()
 
     @staticmethod
-    def _markitdown_extract(md: Any, file_bytes: bytes, filename: str) -> str:
+    def _markitdown_extract(md: Any, file_bytes: bytes, filename: str, mime_type: str = "") -> str:
         """Convert file bytes to Markdown text via MarkItDown."""
-        stream = io.BytesIO(file_bytes)
-        stream.name = filename  # MarkItDown uses the name for format detection
-        result = md.convert_stream(stream)
+        try:
+            from markitdown import StreamInfo  # type: ignore
+            ext = f".{filename.rsplit('.', 1)[-1]}" if "." in filename else ""
+            stream_info = StreamInfo(
+                mimetype=mime_type or None,
+                extension=ext or None,
+                filename=filename or None,
+            )
+            result = md.convert_stream(io.BytesIO(file_bytes), stream_info=stream_info)
+        except ImportError:
+            # Fallback for older markitdown versions without StreamInfo
+            stream = io.BytesIO(file_bytes)
+            stream.name = filename
+            result = md.convert_stream(stream)
         return result.text_content or ""
 
     # ------------------------------------------------------------------
