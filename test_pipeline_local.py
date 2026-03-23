@@ -1,25 +1,30 @@
 #!/usr/bin/env python3
 """
-Test the full ingestion pipeline locally with a file on disk.
+Fetch real Jira tickets, extract metadata & classifications, save to JSON.
+
+No chunking, no embeddings, no LLM — just fetch, classify, and store.
 
 Usage:
-    python test_pipeline_local.py path/to/file.pptx
-    python test_pipeline_local.py path/to/file.pdf --ticket-key TEST-42
-    python test_pipeline_local.py path/to/file.docx --output-dir output/test
+    export JIRA_BASE_URL=https://jira.example.com
+    export JIRA_TOKEN=your-token
 
-Runs extraction → metadata → triage → chunking → quality → description →
-entities → summary.  Skips LLM and embeddings (no API keys needed).
-Writes the assembled document to a local JSON file.
+    python test_pipeline_local.py IDMT-123
+    python test_pipeline_local.py IDMT-123 IDMT-456 IDMT-789
+    python test_pipeline_local.py IDMT-123 --output-dir output/tickets
+    python test_pipeline_local.py IDMT-123 --verify-ssl
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,127 +33,190 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def build_fake_ticket_data(
-    file_path: Path,
+async def fetch_and_classify(
     ticket_key: str,
+    jira_client: Any,
 ) -> dict:
-    """Build a synthetic ticket_data dict that mirrors Jira's API shape."""
-    file_bytes = file_path.read_bytes()
-    filename = file_path.name
-    ext = file_path.suffix.lstrip(".").lower()
-    size = len(file_bytes)
+    """
+    Fetch a single ticket from Jira and build a classified document.
 
-    # Guess MIME type
-    mime_map = {
-        "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        "ppt": "application/vnd.ms-powerpoint",
-        "pdf": "application/pdf",
-        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "doc": "application/msword",
-        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "csv": "text/csv",
-    }
-    mime_type = mime_map.get(ext, "application/octet-stream")
+    Returns a dict with:
+      - ticket_key, fetched_at
+      - metadata (title, reporter, labels, components, etc.)
+      - classified_links (vs, product, dependency, parent, related, etc.)
+      - description_classification (empty/junk/thin/usable/rich)
+      - quality_tier (A/B/C/D)
+      - themes (linked issues from get_ticket_data)
+      - attachments (raw metadata, no download)
+      - raw_fields (full Jira fields for inspection)
+    """
+    from jira_ingestion.ingestion.metadata import extract_metadata, classify_links
+    from jira_ingestion.ingestion.description import classify_description
+    from jira_ingestion.ingestion.quality import determine_quality_tier
 
-    attachment = {
-        "id": "local-1",
-        "filename": filename,
-        "mimeType": mime_type,
-        "size": size,
-        "content": f"file://{file_path.resolve()}",  # pseudo-URL
-        "created": "2026-01-01T00:00:00.000+0000",
-        "author": {"displayName": "Local Test"},
-        # stash bytes so triage/extraction can use them without downloading
-        "_local_bytes": file_bytes,
-        "ext": ext,
-    }
+    # Fetch from Jira
+    ticket_data = await jira_client.get_ticket_data(ticket_key)
+    fields = ticket_data.get("fields", {})
+
+    # Metadata extraction
+    meta = extract_metadata(fields, ticket_key)
+    meta["classified_links"] = classify_links(fields.get("issuelinks", []))
+
+    # Description classification
+    desc_class, desc_data = classify_description(fields.get("description"))
+
+    # Attachment info (no download)
+    attachments = ticket_data.get("attachments", [])
+    attachment_summary = []
+    for att in attachments:
+        ext = ""
+        filename = att.get("filename", "")
+        if "." in filename:
+            ext = filename.rsplit(".", 1)[-1].lower()
+        attachment_summary.append({
+            "id": att.get("id"),
+            "filename": filename,
+            "mimeType": att.get("mimeType", ""),
+            "size": att.get("size", 0),
+            "created": att.get("created", ""),
+            "author": (att.get("author") or {}).get("displayName", ""),
+            "extension": ext,
+        })
+
+    # Determine quality tier (based on attachments + description, no chunks)
+    has_extractable = any(
+        a["extension"] in ("pptx", "ppt", "pdf", "docx", "doc")
+        for a in attachment_summary
+    )
+    content_source = None
+    if has_extractable:
+        # Pick the most likely primary extension
+        for a in attachment_summary:
+            if a["extension"] in ("pptx", "ppt", "pdf", "docx", "doc"):
+                content_source = a["extension"]
+                break
+
+    quality_tier = determine_quality_tier(content_source, desc_class, [])
+
+    # Themes from get_ticket_data
+    themes = ticket_data.get("themes", [])
+
+    now = datetime.now(timezone.utc).isoformat()
 
     return {
-        "key": ticket_key,
-        "attachments": [attachment],
-        "themes": [],
-        "fields": {
-            "summary": file_path.stem.replace("_", " ").replace("-", " "),
-            "description": "",
-            "reporter": {"displayName": "Local Test"},
-            "created": "2026-01-01T00:00:00.000+0000",
-            "updated": "2026-01-01T00:00:00.000+0000",
-            "labels": [],
-            "components": [],
-            "priority": {"name": "Medium"},
-            "issuelinks": [],
-            "comment": {"comments": []},
-            "attachment": [attachment],
+        "ticket_key": ticket_key,
+        "fetched_at": now,
+        "quality_tier": quality_tier,
+        "content_source": content_source or "none",
+        "description_classification": desc_class,
+        "description_word_count": desc_data["word_count"] if desc_data else 0,
+        "metadata": {
+            "title": meta["title"],
+            "summary": meta["summary"],
+            "reporter": meta["reporter"],
+            "created": meta["created"],
+            "labels": meta["labels"],
+            "components": meta["components"],
+            "business_unit": meta["business_unit"],
+            "product_area": meta["product_area"],
+            "priority": meta["priority"],
+            "epic_key": meta["epic_key"],
+            "substantive_comments": meta["substantive_comments"],
+            "metadata_text": meta["metadata_text"],
         },
+        "classified_links": meta["classified_links"],
+        "themes": themes,
+        "attachments": attachment_summary,
+        "attachment_count": len(attachments),
+        "raw_fields": _sanitize_fields(fields),
     }
 
 
-def local_download(att: dict) -> bytes:
-    """Download function that reads from disk instead of Jira."""
-    if "_local_bytes" in att:
-        return att["_local_bytes"]
+def _sanitize_fields(fields: dict) -> dict:
+    """Keep raw fields but strip large binary/nested data for readability."""
+    sanitized = {}
+    skip_keys = {"attachment", "comment", "worklog"}
+    for k, v in fields.items():
+        if k in skip_keys:
+            continue
+        # Truncate very long strings
+        if isinstance(v, str) and len(v) > 2000:
+            sanitized[k] = v[:2000] + "... [truncated]"
+        else:
+            sanitized[k] = v
+    return sanitized
 
-    content = att.get("content", "")
-    if content.startswith("file://"):
-        path = content[len("file://"):]
-        return Path(path).read_bytes()
 
-    raise RuntimeError(f"Cannot download: {content}")
+async def main_async(args: argparse.Namespace) -> None:
+    from jira_ingestion.clients.jira.value_stream_client import JiraValueStreamClient
+
+    base_url = os.environ.get("JIRA_BASE_URL", "")
+    token = os.environ.get("JIRA_TOKEN", "")
+
+    if not base_url or not token:
+        print("Error: Set JIRA_BASE_URL and JIRA_TOKEN environment variables.", file=sys.stderr)
+        sys.exit(1)
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    client = JiraValueStreamClient(
+        base_url=base_url,
+        token=token,
+        verify_ssl=args.verify_ssl,
+    )
+
+    try:
+        logger.info("Authenticating with Jira at %s ...", base_url)
+        await client.authenticate()
+
+        results = []
+        for ticket_key in args.tickets:
+            logger.info("Fetching %s ...", ticket_key)
+            try:
+                doc = await fetch_and_classify(ticket_key, client)
+                results.append(doc)
+
+                # Save individual ticket JSON
+                ticket_path = output_dir / f"{ticket_key}.json"
+                ticket_path.write_text(json.dumps(doc, indent=2, default=str))
+                logger.info("Saved %s → %s", ticket_key, ticket_path)
+
+                # Print summary
+                print(f"\n  {ticket_key}")
+                print(f"    Quality:     {doc['quality_tier']}")
+                print(f"    Source:      {doc['content_source']}")
+                print(f"    Desc class:  {doc['description_classification']} ({doc['description_word_count']} words)")
+                print(f"    Attachments: {doc['attachment_count']}")
+                print(f"    Themes:      {len(doc['themes'])}")
+                print(f"    Links:       {sum(len(v) for v in doc['classified_links'].values())}")
+                print(f"    Components:  {doc['metadata']['components']}")
+                print(f"    Labels:      {doc['metadata']['labels']}")
+
+            except Exception as exc:
+                logger.error("Failed to process %s: %s", ticket_key, exc)
+
+        # Save combined output if multiple tickets
+        if len(results) > 1:
+            combined_path = output_dir / "all_tickets.json"
+            combined_path.write_text(json.dumps(results, indent=2, default=str))
+            logger.info("Combined output → %s", combined_path)
+
+    finally:
+        await client.close()
+
+    print(f"\nDone. {len(results)} ticket(s) saved to {output_dir}/")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Test ingestion pipeline with a local file")
-    parser.add_argument("file", type=Path, help="Path to PPTX / PDF / DOCX file")
-    parser.add_argument("--ticket-key", default="TEST-1", help="Fake ticket key (default: TEST-1)")
-    parser.add_argument("--output-dir", default="output/test", help="Output directory for JSON")
-    args = parser.parse_args()
-
-    if not args.file.is_file():
-        print(f"File not found: {args.file}", file=sys.stderr)
-        sys.exit(1)
-
-    ext = args.file.suffix.lstrip(".").lower()
-    if ext not in ("pptx", "ppt", "pdf", "docx", "doc", "xlsx", "csv"):
-        print(f"Unsupported file type: .{ext}", file=sys.stderr)
-        sys.exit(1)
-
-    logger.info("Building fake ticket data from %s", args.file)
-    ticket_data = build_fake_ticket_data(args.file, args.ticket_key)
-
-    logger.info("Running assemble_document pipeline ...")
-    from jira_ingestion.ingestion.pipeline import assemble_document
-
-    document = assemble_document(
-        ticket_data=ticket_data,
-        download_fn=local_download,
-        llm_client=None,
-        embedding_client=None,
-        dict_path=None,
+    parser = argparse.ArgumentParser(
+        description="Fetch Jira tickets, classify metadata, save to JSON"
     )
-
-    # Save via DocumentStore
-    from jira_ingestion.ingestion.storage import DocumentStore
-
-    store = DocumentStore(output_dir=args.output_dir, save_embeddings=False)
-    out_path = store.save(document, fmt="json")
-    logger.info("Document saved to %s", out_path)
-
-    # Print summary
-    obs = document["observed"]
-    sup = document["supervision"]
-    print()
-    print(f"  Ticket:          {document['ticket_key']}")
-    print(f"  Quality tier:    {obs['quality_tier']}")
-    print(f"  Content source:  {obs['content_source']}")
-    print(f"  Chunks:          {obs['stats']['chunk_count']}")
-    print(f"  Sections:        {obs['stats']['section_count']}")
-    print(f"  Words:           {obs['stats']['total_word_count']}")
-    print(f"  Entities:        {obs['stats']['entity_mention_count']}")
-    print(f"  Summary:         {obs['summary_text'][:120]}...")
-    print(f"  VS trainable:    {sup['trainability']['is_trainable_for_vs']}")
-    print(f"  Quality score:   {sup['trainability']['source_quality_score']}")
-    print(f"  Output:          {out_path}")
-    print()
+    parser.add_argument("tickets", nargs="+", help="Jira ticket IDs (e.g. IDMT-123 IDMT-456)")
+    parser.add_argument("--output-dir", default="output/tickets", help="Output directory")
+    parser.add_argument("--verify-ssl", action="store_true", default=False, help="Verify SSL certs")
+    args = parser.parse_args()
+    asyncio.run(main_async(args))
 
 
 if __name__ == "__main__":
