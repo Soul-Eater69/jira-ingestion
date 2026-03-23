@@ -12,32 +12,64 @@ from __future__ import annotations
 
 import io
 import logging
-from typing import Any, Dict, List
+from abc import ABC, abstractmethod
+from typing import Any, Dict, List, Optional
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
 
-class JiraValueStreamClient:
-    """Async Jira client that exposes ticket data and attachment text extraction."""
+# ---------------------------------------------------------------------------
+# Base protocol
+# ---------------------------------------------------------------------------
 
-    def __init__(self, base_url: str, token: str, verify_ssl: bool = False) -> None:
+
+class ValueStreamFetcher(ABC):
+    """Interface that any value-stream data source must implement."""
+
+    @abstractmethod
+    async def authenticate(self) -> None: ...
+
+    @abstractmethod
+    async def get_ticket_data(self, ticket_id: str) -> Dict[str, Any]: ...
+
+    @abstractmethod
+    async def fetch_attachment_content(
+        self, attachments: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]: ...
+
+    @abstractmethod
+    async def download_attachment(self, url: str, dest_path: str) -> None: ...
+
+
+# ---------------------------------------------------------------------------
+# Low-level REST client
+# ---------------------------------------------------------------------------
+
+
+class JIRARestClient:
+    """Thin async wrapper around the Jira REST API v2."""
+
+    def __init__(
+        self,
+        base_url: str,
+        auth_token: str,
+        api_token: str,
+        verify_ssl: bool = True,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
-        self.token = token
+        self.auth_token = auth_token
+        self.api_token = api_token
         self.verify_ssl = verify_ssl
-        self._client: httpx.AsyncClient | None = None
+        self._client: Optional[httpx.AsyncClient] = None
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
-    async def authenticate(self) -> None:
+    async def _authenticate(self) -> None:
         """Create an authenticated httpx client and verify credentials."""
         self._client = httpx.AsyncClient(
             verify=self.verify_ssl,
             headers={
-                "Authorization": f"Bearer {self.token}",
+                "Authorization": f"Bearer {self.auth_token}",
                 "Accept": "application/json",
                 "Content-Type": "application/json",
             },
@@ -52,6 +84,52 @@ class JiraValueStreamClient:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
             self._client = None
+
+    async def get_issue_by_key(
+        self,
+        key: str,
+        fields: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Fetch an issue by key, optionally restricting to *fields*."""
+        if self._client is None:
+            raise RuntimeError("Call _authenticate() first.")
+        url = f"{self.base_url}/rest/api/2/issue/{key}"
+        params: Dict[str, str] = {}
+        if fields:
+            params["fields"] = ",".join(fields)
+        response = await self._client.get(url, params=params)
+        response.raise_for_status()
+        return response.json()
+
+
+# ---------------------------------------------------------------------------
+# High-level value-stream client
+# ---------------------------------------------------------------------------
+
+
+class JiraValueStreamClient(ValueStreamFetcher):
+    """Async Jira client that exposes ticket data and attachment text extraction."""
+
+    def __init__(self, base_url: str, token: str, verify_ssl: bool = False) -> None:
+        self.base_url = base_url
+        self.token = token
+        self.verify_ssl = verify_ssl
+        self.client = JIRARestClient(
+            base_url=base_url,
+            auth_token=token,
+            api_token=token,
+            verify_ssl=verify_ssl,
+        )
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def authenticate(self) -> None:
+        await self.client._authenticate()
+
+    async def close(self) -> None:
+        await self.client.close()
 
     async def __aenter__(self) -> "JiraValueStreamClient":
         await self.authenticate()
@@ -70,13 +148,9 @@ class JiraValueStreamClient:
           - attachments: list of attachment metadata dicts
           - themes:      list of linked issues (key, summary, status)
         """
-        if self._client is None:
-            raise RuntimeError("Call authenticate() first.")
-        url = f"{self.base_url}/rest/api/2/issue/{ticket_id}"
-        params = {"fields": "attachment,issuelinks"}
-        response = await self._client.get(url, params=params)
-        response.raise_for_status()
-        issue = response.json()
+        issue = await self.client.get_issue_by_key(
+            ticket_id, fields=["attachment", "issuelinks"]
+        )
         fields = issue.get("fields", {})
 
         attachments = issue.get("fields", {}).get("attachment", [])
