@@ -251,6 +251,7 @@ def assemble_document(
         chunks=all_for_summary,
         metadata=meta,
         llm_client=llm_client,
+        model=cfg.llm_model,
     )
 
     # ------------------------------------------------------------------

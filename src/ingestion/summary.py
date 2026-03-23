@@ -55,10 +55,6 @@ def _llm_summary(
     model: Optional[str],
 ) -> str:
     """Use an LLM to summarise the top 8 content chunks."""
-    from src.config import LLM_MODEL
-
-    model = model or LLM_MODEL
-
     # Pick top 8 chunks by word count, excluding boilerplate
     top_chunks = sorted(
         [c for c in chunks if not c.get("is_boilerplate")],
@@ -71,6 +67,8 @@ def _llm_summary(
 
     input_text = "\n---\n".join(c["text"] for c in top_chunks)
     prompt = f"{SUMMARY_INSTRUCTION}\n\n{input_text}"
+
+    model = model or "gpt-4o-mini"
 
     try:
         response = llm_client.chat.completions.create(

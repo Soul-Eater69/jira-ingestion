@@ -19,8 +19,6 @@ dependencies = [
     "PyMuPDF>=1.23.0",
     # Text processing
     "langdetect>=1.0.9",
-    # LLM + Embeddings
-    "openai>=1.30.0",
     # Vector store — LangGraph ecosystem
     "langgraph>=0.2.0",
     "langchain-core>=0.2.0",
