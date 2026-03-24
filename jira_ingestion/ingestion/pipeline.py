@@ -19,6 +19,21 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _parse_ts(value: str) -> Optional[datetime]:
+    """Parse an ISO 8601 timestamp string.  Returns None on empty or malformed input."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        logger.debug("Could not parse timestamp: %r", value)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -58,16 +73,22 @@ async def ingest_ticket(
         storage_fmt:       'json' | 'jsonl' | 'parquet' (default 'json').
         config:            JiraIngestionConfig instance (uses defaults if None).
     """
-    # Fetch ticket once — used for both idempotency check and assembly
-    ticket_data = await jira_client.get_ticket_data(ticket_key)
+    from jira_ingestion.config import JiraIngestionConfig
+    cfg = config if config is not None else JiraIngestionConfig()
 
-    # Idempotency check
+    # Fetch ticket once — used for both idempotency check and assembly.
+    # Pass config so the client can build the correct field list for this tenant.
+    ticket_data = await jira_client.get_ticket_data(ticket_key, config=cfg)
+
+    # Idempotency check — uses parsed timestamps to avoid string-comparison drift.
     if not force_reprocess:
         existing = coarse_index.get(ticket_key)
         if existing:
             updated = ticket_data["fields"].get("updated", "")
             stored_updated = (existing.get("metadata") or {}).get("updated_at", "")
-            if updated and stored_updated and updated <= stored_updated:
+            updated_dt = _parse_ts(updated)
+            stored_dt = _parse_ts(stored_updated)
+            if updated_dt and stored_dt and updated_dt <= stored_dt:
                 logger.info("Skipping %s — not modified since last ingest", ticket_key)
                 return existing
 
@@ -97,20 +118,38 @@ async def ingest_ticket(
             "This attachment was not among the top-scored Layer-1 candidates."
         )
 
-    # Assemble document
+    # Assemble document (config is forwarded for field-map-aware metadata extraction)
     document = assemble_document(
         ticket_data=ticket_data,
         download_fn=cached_download,
         llm_client=llm_client,
         embedding_client=embedding_client,
         dict_path=dict_path,
-        config=config,
+        config=cfg,
     )
 
-    # Persist to disk before indexing (optional)
+    # Persist artifacts (optional)
     if storage_dir:
         from .storage import DocumentStore
         store = DocumentStore(output_dir=storage_dir)
+
+        # Raw ticket payload — full audit trail
+        if cfg.enable_raw_artifact_persistence:
+            store.save_raw_ticket(ticket_key, ticket_data)
+
+        # Debug: which attachment IDs were pre-fetched
+        if cfg.enable_debug_stage_persistence:
+            store.save_debug_stage(
+                ticket_key,
+                "prefetched_attachment_ids",
+                list(_prefetched.keys()),
+            )
+
+        # Attachment text extraction artifacts
+        if cfg.enable_attachment_text_persistence and _attachments:
+            extracted = await jira_client.fetch_attachment_content(_attachments)
+            store.save_extracted_attachments(ticket_key, extracted)
+
         store.save(document, fmt=storage_fmt)
 
     # Index
@@ -182,7 +221,7 @@ def assemble_document(
     # ------------------------------------------------------------------
     # 1. Metadata extraction
     # ------------------------------------------------------------------
-    meta = extract_metadata(fields, ticket_key)
+    meta = extract_metadata(fields, ticket_key, config=cfg)
     meta["classified_links"] = classify_links(fields.get("issuelinks", []))
 
     # ------------------------------------------------------------------

@@ -31,9 +31,15 @@ from jira_ingestion.ingestion.indexing import (
     InMemoryVectorIndex,
     InMemorySupervisionStore,
     InMemoryMetadataIndex,
+    JsonBackedMetadataIndex,
+    JsonBackedSupervisionStore,
     index_retrieval_view,
     index_supervision_view,
 )
+from jira_ingestion.dlq import DeadLetterQueue
+from jira_ingestion.retries import RetryPolicy, retry_async, retry_sync
+from jira_ingestion.telemetry import record_ingest, record_skip, record_failure, timed_stage
+from jira_ingestion.models.validation import validate_ticket_input
 from jira_ingestion.models import (
     AttachmentMeta,
     TicketInput,
@@ -58,6 +64,8 @@ __all__ = [
     "InMemoryVectorIndex",
     "InMemorySupervisionStore",
     "InMemoryMetadataIndex",
+    "JsonBackedMetadataIndex",
+    "JsonBackedSupervisionStore",
     "index_retrieval_view",
     "index_supervision_view",
     # Typed schemas
@@ -69,4 +77,14 @@ __all__ = [
     "ObservedDocument",
     "SupervisionDocument",
     "PipelineDocument",
+    # Platform modules
+    "DeadLetterQueue",
+    "RetryPolicy",
+    "retry_async",
+    "retry_sync",
+    "record_ingest",
+    "record_skip",
+    "record_failure",
+    "timed_stage",
+    "validate_ticket_input",
 ]

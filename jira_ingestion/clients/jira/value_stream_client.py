@@ -32,7 +32,7 @@ class ValueStreamFetcher(ABC):
     async def authenticate(self) -> None: ...
 
     @abstractmethod
-    async def get_ticket_data(self, ticket_id: str) -> Dict[str, Any]: ...
+    async def get_ticket_data(self, ticket_id: str, config: Optional[Any] = None) -> Dict[str, Any]: ...
 
     @abstractmethod
     async def fetch_attachment_content(
@@ -142,25 +142,30 @@ class JiraValueStreamClient(ValueStreamFetcher):
     # Core API calls
     # ------------------------------------------------------------------
 
-    # Fields fetched for every ticket — covers metadata, description, links, and
-    # the most common custom fields.  Any unknown customfield_* values are
-    # silently ignored by the pipeline, so requesting extras is safe.
-    _TICKET_FIELDS: List[str] = [
+    # Non-custom base fields — always requested regardless of tenant config.
+    _BASE_FIELDS: List[str] = [
         "summary", "description", "reporter", "assignee",
         "created", "updated", "status", "priority", "issuetype",
         "labels", "components", "attachment", "issuelinks",
         "comment", "parent",
-        # Common custom fields (epic link, story points, sprint, etc.)
-        "customfield_10014",  # Epic Link
-        "customfield_10016",  # Story Points
-        "customfield_10020",  # Sprint
-        "customfield_10001",  # Team
-        "customfield_10002",  # Business Unit (common)
-        "customfield_10003",  # Product Area (common)
-        "customfield_10010",  # Epic Name
     ]
 
-    async def get_ticket_data(self, ticket_id: str) -> Dict[str, Any]:
+    def _build_ticket_fields(self, config: Optional[Any] = None) -> List[str]:
+        """
+        Build the Jira fields list from base fields + configured custom fields.
+
+        Custom field IDs come from config.jira_field_map so the client stays
+        portable across Jira tenants without code changes.
+        """
+        base = list(self._BASE_FIELDS)
+        jira_field_map: dict = getattr(config, "jira_field_map", {}) if config else {}
+        custom = sorted({
+            v for v in jira_field_map.values()
+            if isinstance(v, str) and v.startswith("customfield_")
+        })
+        return base + custom
+
+    async def get_ticket_data(self, ticket_id: str, config: Optional[Any] = None) -> Dict[str, Any]:
         """
         Fetch a Jira ticket and return structured data with:
           - key:         ticket key (e.g. "IDEA-1234")
@@ -169,7 +174,7 @@ class JiraValueStreamClient(ValueStreamFetcher):
           - themes:      list of linked issues (key, summary, status)
         """
         issue = await self.client.get_issue_by_key(
-            ticket_id, fields=self._TICKET_FIELDS
+            ticket_id, fields=self._build_ticket_fields(config)
         )
         fields = issue.get("fields", {})
 
@@ -250,72 +255,79 @@ class JiraValueStreamClient(ValueStreamFetcher):
         """
         Download each attachment and extract its text content using MarkItDown.
 
-        Args:
-            attachments: List of attachment dicts from get_ticket_data().
-                Each dict should have at least 'content' (URL),
-                'filename', and optionally 'mimeType'.
+        Returns a list of dicts with keys:
+          - filename:     original attachment filename
+          - mime_type:    MIME type reported by Jira
+          - text_content: extracted Markdown text (empty string on failure)
+          - error:        None | 'no_content_url' | 'markitdown_not_installed'
+                          | '<ExcType>: <message>'
 
-        Returns:
-            List of dicts with keys:
-                - filename:     original attachment filename
-                - mime_type:    MIME type reported by Jira
-                - text_content: extracted Markdown text (empty string on failure)
-                - error:        error message if extraction failed, else None
+        Behaviour when markitdown is unavailable:
+          - ingestion continues without raising
+          - each attachment gets error='markitdown_not_installed'
+
+        Reuses the authenticated Jira session — no new clients created.
         """
         try:
             from markitdown import MarkItDown  # type: ignore
-
-            md = MarkItDown()
+            md: Optional[Any] = MarkItDown()
         except ImportError:
             logger.warning("markitdown not installed; attachment text extraction disabled.")
             md = None
 
-        headers = {"Authorization": f"Bearer {self.token}"}
+        http_client = self.client._client
+        if http_client is None:
+            raise RuntimeError("Call authenticate() before fetching attachment content.")
+
         results: List[Dict[str, Any]] = []
+        for att in attachments:
+            url = att.get("content", "")
+            filename = att.get("filename", "")
+            mime_type = att.get("mimeType", "")
 
-        async with httpx.AsyncClient(verify=self.verify_ssl) as client:
-            for att in attachments:
-                url = att.get("content", "")
-                filename = att.get("filename", "")
-                mime_type = att.get("mimeType", "")
+            if not url:
+                results.append({
+                    "filename": filename,
+                    "mime_type": mime_type,
+                    "text_content": "",
+                    "error": "no_content_url",
+                })
+                continue
 
-                if not url:
-                    results.append({
-                        "filename": filename,
-                        "mime_type": mime_type,
-                        "text_content": "",
-                        "error": "No content URL",
-                    })
-                    continue
+            if md is None:
+                results.append({
+                    "filename": filename,
+                    "mime_type": mime_type,
+                    "text_content": "",
+                    "error": "markitdown_not_installed",
+                })
+                continue
 
-                try:
-                    response = await client.get(url, headers=headers, timeout=60.0)
-                    response.raise_for_status()
-
-                    # Determine file extension for better format detection
-                    ext = f".{filename.rsplit('.', 1)[-1]}" if "." in filename else ""
-                    stream_info = self._build_stream_info(
-                        mime_type=mime_type, ext=ext, filename=filename
-                    )
-
-                    result = md.convert_stream(
-                        io.BytesIO(response.content),
-                        stream_info=stream_info,
-                    )
-
-                    results.append({
-                        "filename": filename,
-                        "mime_type": mime_type,
-                        "text_content": result.text_content,
-                        "error": None,
-                    })
-                except Exception as exc:
-                    results.append({
-                        "filename": filename,
-                        "mime_type": mime_type,
-                        "text_content": "",
-                        "error": str(exc),
-                    })
+            try:
+                response = await http_client.get(url, timeout=120.0)
+                response.raise_for_status()
+                ext = f".{filename.rsplit('.', 1)[-1]}" if "." in filename else ""
+                stream_info = self._build_stream_info(
+                    mime_type=mime_type, ext=ext, filename=filename
+                )
+                result = md.convert_stream(
+                    io.BytesIO(response.content),
+                    stream_info=stream_info,
+                )
+                results.append({
+                    "filename": filename,
+                    "mime_type": mime_type,
+                    "text_content": result.text_content or "",
+                    "error": None,
+                })
+            except Exception as exc:
+                logger.exception("Attachment extraction failed for %s", filename)
+                results.append({
+                    "filename": filename,
+                    "mime_type": mime_type,
+                    "text_content": "",
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
 
         return results
 
@@ -324,12 +336,12 @@ class JiraValueStreamClient(ValueStreamFetcher):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _build_stream_info(
-        mime_type: str, ext: str, filename: str
-    ) -> Any:
-        """Build a MarkItDown StreamInfo for format detection."""
-        from markitdown import StreamInfo  # type: ignore
-
+    def _build_stream_info(mime_type: str, ext: str, filename: str) -> Any:
+        """Build a MarkItDown StreamInfo for format detection. Returns None if unavailable."""
+        try:
+            from markitdown import StreamInfo  # type: ignore
+        except ImportError:
+            return None
         return StreamInfo(
             mimetype=mime_type or None,
             extension=ext or None,

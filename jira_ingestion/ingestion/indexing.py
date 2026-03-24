@@ -14,8 +14,10 @@ passing a LangChain-compatible vector store to LangChainVectorIndex.
 
 from __future__ import annotations
 
+import json
 import logging
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -320,48 +322,151 @@ def index_supervision_view(
 
 
 # ---------------------------------------------------------------------------
+# JSON-backed persistent stores (restart-safe metadata + supervision)
+# ---------------------------------------------------------------------------
+
+class JsonBackedMetadataIndex(BaseMetadataIndex):
+    """
+    Metadata index backed by a local JSON file.
+
+    Survives process restart.  For high-throughput production workloads
+    replace with a SQLite or Postgres-backed implementation.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._store: dict[str, dict] = self._load()
+
+    def _load(self) -> dict[str, dict]:
+        if not self.path.exists():
+            return {}
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Could not load metadata store from %s: %s", self.path, exc)
+            return {}
+
+    def _flush(self) -> None:
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump(self._store, fh, indent=2, ensure_ascii=False, default=str)
+
+    def upsert(self, id: str, fields: dict) -> None:
+        self._store[id] = fields
+        self._flush()
+
+    def get(self, id: str) -> Optional[dict]:
+        return self._store.get(id)
+
+    def __len__(self) -> int:
+        return len(self._store)
+
+
+class JsonBackedSupervisionStore(BaseSupervisionStore):
+    """
+    Supervision store backed by a local JSON file.
+
+    Survives process restart.  Kept separate from retrieval indexes to
+    preserve label isolation.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._store: dict[str, dict] = self._load()
+
+    def _load(self) -> dict[str, dict]:
+        if not self.path.exists():
+            return {}
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Could not load supervision store from %s: %s", self.path, exc)
+            return {}
+
+    def _flush(self) -> None:
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump(self._store, fh, indent=2, ensure_ascii=False, default=str)
+
+    def upsert(self, id: str, data: dict) -> None:
+        self._store[id] = data
+        self._flush()
+
+    def get(self, id: str) -> Optional[dict]:
+        return self._store.get(id)
+
+    def __len__(self) -> int:
+        return len(self._store)
+
+
+# ---------------------------------------------------------------------------
 # Index factory
 # ---------------------------------------------------------------------------
 
 def create_indexes(
     backend: str = "langgraph",
     langchain_stores: Optional[dict[str, Any]] = None,
+    metadata_store_path: Optional[str] = None,
+    supervision_store_path: Optional[str] = None,
 ) -> tuple[BaseVectorIndex, BaseVectorIndex, BaseMetadataIndex, BaseSupervisionStore]:
     """
     Factory that returns (coarse, fine, metadata, supervision) indexes.
 
     Args:
-        backend: 'langgraph' (default) | 'langchain' | 'memory'
-        langchain_stores: Required when backend='langchain'.
-            {"coarse": <VectorStore>, "fine": <VectorStore>}
+        backend:               'langgraph' (default) | 'langchain' | 'memory'
+        langchain_stores:      Required when backend='langchain'.
+                               {"coarse": <VectorStore>, "fine": <VectorStore>}
+        metadata_store_path:   Path to persist the metadata index as JSON.
+                               None = in-memory only (default).
+        supervision_store_path: Path to persist supervision labels as JSON.
+                               None = in-memory only (default).
 
     Examples:
-        # LangGraph in-memory (default, good for dev)
-        coarse, fine, meta, sup = create_indexes()
+        # In-memory, good for dev / unit tests
+        coarse, fine, meta, sup = create_indexes(backend="memory")
 
-        # LangChain Chroma (persistent)
+        # LangGraph with persistent metadata + supervision
+        coarse, fine, meta, sup = create_indexes(
+            metadata_store_path="output/metadata.json",
+            supervision_store_path="output/supervision.json",
+        )
+
+        # LangChain Chroma + persistent metadata/supervision
         from langchain_chroma import Chroma
         from langchain_core.embeddings import FakeEmbeddings
         stores = {
             "coarse": Chroma("tickets_coarse", FakeEmbeddings(size=3072), persist_directory="./db"),
             "fine":   Chroma("tickets_fine",   FakeEmbeddings(size=3072), persist_directory="./db"),
         }
-        coarse, fine, meta, sup = create_indexes(backend="langchain", langchain_stores=stores)
+        coarse, fine, meta, sup = create_indexes(
+            backend="langchain",
+            langchain_stores=stores,
+            metadata_store_path="output/metadata.json",
+            supervision_store_path="output/supervision.json",
+        )
     """
     if backend == "langgraph":
         coarse = LangGraphVectorIndex("tickets_coarse")
         fine   = LangGraphVectorIndex("tickets_fine")
-
     elif backend == "langchain":
         if not langchain_stores:
             raise ValueError("langchain_stores must be provided when backend='langchain'")
         coarse = LangChainVectorIndex(langchain_stores["coarse"])
         fine   = LangChainVectorIndex(langchain_stores["fine"])
-
     else:  # "memory" — unit tests / CI
         coarse = InMemoryVectorIndex()
         fine   = InMemoryVectorIndex()
 
-    metadata   = InMemoryMetadataIndex()
-    supervision = InMemorySupervisionStore()
+    metadata: BaseMetadataIndex = (
+        JsonBackedMetadataIndex(metadata_store_path)
+        if metadata_store_path
+        else InMemoryMetadataIndex()
+    )
+    supervision: BaseSupervisionStore = (
+        JsonBackedSupervisionStore(supervision_store_path)
+        if supervision_store_path
+        else InMemorySupervisionStore()
+    )
     return coarse, fine, metadata, supervision

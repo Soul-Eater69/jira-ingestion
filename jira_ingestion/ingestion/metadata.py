@@ -54,18 +54,29 @@ LINK_TYPE_MAP: dict[str, str] = {
 # Public API
 # ---------------------------------------------------------------------------
 
-def extract_metadata(ticket_fields: dict, ticket_key: str) -> dict:
+def extract_metadata(
+    ticket_fields: dict,
+    ticket_key: str,
+    config: Optional[Any] = None,
+) -> dict:
     """
     Extract and structure all useful metadata from raw Jira fields.
+
+    Custom field IDs are resolved from config.jira_field_map when provided,
+    making extraction portable across Jira instances.
 
     Args:
         ticket_fields: The 'fields' dict from Jira API response.
         ticket_key:    The issue key (e.g. "IDEA-1234").
+        config:        JiraIngestionConfig instance (uses defaults if None).
 
     Returns:
         Flat metadata dict ready for pipeline use.
     """
     fields = ticket_fields or {}
+    jira_field_map: dict[str, str] = (
+        getattr(config, "jira_field_map", {}) if config else {}
+    )
 
     # Tier 1 — always extract
     summary = fields.get("summary", "")
@@ -77,11 +88,15 @@ def extract_metadata(ticket_fields: dict, ticket_key: str) -> dict:
         c.get("name", "") for c in (fields.get("components") or []) if isinstance(c, dict)
     ]
 
-    # Tier 2 — extract if available
-    business_unit = _get_custom_field(fields, "Business Unit") or ""
-    product_area = _get_custom_field(fields, "Product Area") or ""
+    # Tier 2 — config-driven custom fields (deterministic, not heuristic)
+    business_unit = _as_text(
+        _resolve_field(fields, jira_field_map.get("business_unit", "customfield_10002"))
+    )
+    product_area = _as_text(
+        _resolve_field(fields, jira_field_map.get("product_area", "customfield_10003"))
+    )
     priority = (fields.get("priority") or {}).get("name", "")
-    epic_key = _get_epic_key(fields)
+    epic_key = _get_epic_key(fields, jira_field_map)
 
     # Tier 3 — comments (first 2-3 substantive ones)
     substantive_comments = _extract_comments(fields.get("comment") or {})
@@ -160,43 +175,47 @@ def classify_links(issuelinks: list[dict]) -> dict[str, list[dict]]:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _get_custom_field(fields: dict, field_name: str) -> Optional[str]:
+def _resolve_field(fields: dict, field_id: Optional[str]) -> Optional[Any]:
+    """Return the raw value of a field by its Jira field ID."""
+    if not field_id:
+        return None
+    return fields.get(field_id)
+
+
+def _as_text(value: Any) -> str:
     """
-    Try to find a custom field by common name patterns.
-    Jira custom fields use IDs like 'customfield_10001' but some may be
-    accessible under their display name through the API.
+    Coerce a Jira field value to a plain string.
+
+    Handles strings, dicts (name/value/key), lists, and None.
     """
-    # Direct name match in top-level fields
-    for key, value in fields.items():
-        if not key.startswith("customfield_"):
-            continue
-        if isinstance(value, str) and field_name.lower() in key.lower():
-            return value
-        if isinstance(value, dict):
-            name = value.get("name") or value.get("value") or ""
-            if name and field_name.lower() in name.lower():
-                return name
-            # Check if the field itself contains the display name
-            if field_name.lower() in str(value).lower():
-                return str(value.get("name") or value.get("value") or "")
-
-    # Fallback: try the camelCase version as a direct field
-    key_guess = "customfield_" + field_name.lower().replace(" ", "_")
-    val = fields.get(key_guess)
-    if val:
-        return str(val) if not isinstance(val, dict) else (val.get("name") or val.get("value") or "")
-
-    return None
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return str(
+            value.get("name")
+            or value.get("value")
+            or value.get("key")
+            or ""
+        )
+    if isinstance(value, list):
+        parts = [_as_text(item) for item in value]
+        return ", ".join(p for p in parts if p)
+    return str(value)
 
 
-def _get_epic_key(fields: dict) -> Optional[str]:
-    """Try several known ways to get the epic key."""
-    # Direct epic link field
-    epic = fields.get("customfield_10014")  # common Jira epic link field ID
+def _get_epic_key(fields: dict, jira_field_map: dict[str, str]) -> Optional[str]:
+    """
+    Resolve the epic link using configured field ID first, then fall back
+    to the parent field used by next-gen Jira projects.
+    """
+    epic_field_id = jira_field_map.get("epic_link", "customfield_10014")
+    epic = _resolve_field(fields, epic_field_id)
     if epic and isinstance(epic, str):
         return epic
 
-    # Parent (next-gen projects)
+    # Next-gen projects store the parent directly
     parent = fields.get("parent")
     if isinstance(parent, dict):
         return parent.get("key")
