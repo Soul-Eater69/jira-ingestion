@@ -10,6 +10,15 @@ Public API:
         ingest_ticket,
         create_indexes,
     )
+
+Typed schemas (no Pydantic required):
+
+    from jira_ingestion.models import (
+        AttachmentMeta,
+        TicketInput,
+        ChunkRecord,
+        PipelineDocument,
+    )
 """
 
 from jira_ingestion.config import JiraIngestionConfig
@@ -25,13 +34,25 @@ from jira_ingestion.ingestion.indexing import (
     index_retrieval_view,
     index_supervision_view,
 )
+from jira_ingestion.models import (
+    AttachmentMeta,
+    TicketInput,
+    ChunkRecord,
+    ClassifiedLinks,
+    TicketMetadata,
+    ObservedDocument,
+    SupervisionDocument,
+    PipelineDocument,
+)
 
 __all__ = [
+    # Core pipeline
     "JiraIngestionConfig",
     "JiraValueStreamClient",
     "assemble_document",
     "ingest_ticket",
     "create_indexes",
+    # Index backends
     "LangGraphVectorIndex",
     "LangChainVectorIndex",
     "InMemoryVectorIndex",
@@ -39,4 +60,13 @@ __all__ = [
     "InMemoryMetadataIndex",
     "index_retrieval_view",
     "index_supervision_view",
+    # Typed schemas
+    "AttachmentMeta",
+    "TicketInput",
+    "ChunkRecord",
+    "ClassifiedLinks",
+    "TicketMetadata",
+    "ObservedDocument",
+    "SupervisionDocument",
+    "PipelineDocument",
 ]
