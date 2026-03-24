@@ -40,7 +40,7 @@ class ValueStreamFetcher(ABC):
     ) -> List[Dict[str, Any]]: ...
 
     @abstractmethod
-    async def download_attachment(self, url: str, dest_path: str) -> None: ...
+    async def download_attachment(self, url_or_att: Any, dest_path: str = "") -> Any: ...
 
 
 # ---------------------------------------------------------------------------
@@ -142,14 +142,34 @@ class JiraValueStreamClient(ValueStreamFetcher):
     # Core API calls
     # ------------------------------------------------------------------
 
+    # Fields fetched for every ticket — covers metadata, description, links, and
+    # the most common custom fields.  Any unknown customfield_* values are
+    # silently ignored by the pipeline, so requesting extras is safe.
+    _TICKET_FIELDS: List[str] = [
+        "summary", "description", "reporter", "assignee",
+        "created", "updated", "status", "priority", "issuetype",
+        "labels", "components", "attachment", "issuelinks",
+        "comment", "parent",
+        # Common custom fields (epic link, story points, sprint, etc.)
+        "customfield_10014",  # Epic Link
+        "customfield_10016",  # Story Points
+        "customfield_10020",  # Sprint
+        "customfield_10001",  # Team
+        "customfield_10002",  # Business Unit (common)
+        "customfield_10003",  # Product Area (common)
+        "customfield_10010",  # Epic Name
+    ]
+
     async def get_ticket_data(self, ticket_id: str) -> Dict[str, Any]:
         """
         Fetch a Jira ticket and return structured data with:
+          - key:         ticket key (e.g. "IDEA-1234")
+          - fields:      all ticket fields (summary, description, links, etc.)
           - attachments: list of attachment metadata dicts
           - themes:      list of linked issues (key, summary, status)
         """
         issue = await self.client.get_issue_by_key(
-            ticket_id, fields=["attachment", "issuelinks"]
+            ticket_id, fields=self._TICKET_FIELDS
         )
         fields = issue.get("fields", {})
 
@@ -179,7 +199,12 @@ class JiraValueStreamClient(ValueStreamFetcher):
                 status = fields_data.get("status", {}).get("name")
                 themes.append({"key": key, "summary": summary, "status": status})
 
-        return {"attachments": attachments, "themes": themes, "fields": fields}
+        return {
+            "key": issue.get("key", ticket_id),
+            "fields": fields,
+            "attachments": attachments,
+            "themes": themes,
+        }
 
     # ------------------------------------------------------------------
     # Attachment handling
@@ -192,22 +217,31 @@ class JiraValueStreamClient(ValueStreamFetcher):
         Supports two calling conventions:
           - download_attachment(url: str, dest_path: str) — saves to disk
           - download_attachment(att: dict) — returns raw bytes (pipeline compat)
+
+        Reuses the authenticated httpx client created by authenticate() to
+        avoid the overhead and auth inconsistency of spawning a new client
+        per download.
         """
-        headers = {"Authorization": f"Bearer {self.token}"}
         if isinstance(url_or_att, dict):
             url = url_or_att.get("content", "")
         else:
             url = url_or_att
 
-        async with httpx.AsyncClient(verify=self.verify_ssl) as client:
-            response = await client.get(url, headers=headers, timeout=60.0)
-            response.raise_for_status()
+        if not url:
+            raise ValueError("No download URL found in attachment")
+
+        http_client = self.client._client
+        if http_client is None:
+            raise RuntimeError("Call authenticate() before downloading attachments.")
+
+        response = await http_client.get(url, timeout=120.0)
+        response.raise_for_status()
 
         if dest_path:
             with open(dest_path, "wb") as f:
                 f.write(response.content)
-        else:
-            return response.content
+            return None
+        return response.content
 
     async def fetch_attachment_content(
         self,

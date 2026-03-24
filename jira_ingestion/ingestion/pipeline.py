@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Literal, Optional
+
+if TYPE_CHECKING:
+    from .indexing import BaseVectorIndex, BaseMetadataIndex, BaseSupervisionStore
 
 logger = logging.getLogger(__name__)
 
@@ -22,17 +25,17 @@ logger = logging.getLogger(__name__)
 async def ingest_ticket(
     ticket_key: str,
     jira_client: Any,
-    coarse_index: Any,
-    fine_index: Any,
-    metadata_index: Any,
-    supervision_store: Any,
+    coarse_index: "BaseVectorIndex",
+    fine_index: "BaseVectorIndex",
+    metadata_index: "BaseMetadataIndex",
+    supervision_store: "BaseSupervisionStore",
     trigger: str = "webhook",
     llm_client: Optional[Any] = None,
     embedding_client: Optional[Any] = None,
     dict_path: Optional[str] = None,
     force_reprocess: bool = False,
     storage_dir: Optional[str] = None,
-    storage_fmt: str = "json",
+    storage_fmt: Literal["json", "jsonl", "parquet"] = "json",
     config: Optional[Any] = None,
 ) -> dict:
     """
@@ -55,31 +58,49 @@ async def ingest_ticket(
         storage_fmt:       'json' | 'jsonl' | 'parquet' (default 'json').
         config:            JiraIngestionConfig instance (uses defaults if None).
     """
+    # Fetch ticket once — used for both idempotency check and assembly
+    ticket_data = await jira_client.get_ticket_data(ticket_key)
+
     # Idempotency check
     if not force_reprocess:
         existing = coarse_index.get(ticket_key)
         if existing:
-            ticket_data = await jira_client.get_ticket_data(ticket_key)
             updated = ticket_data["fields"].get("updated", "")
             stored_updated = (existing.get("metadata") or {}).get("updated_at", "")
             if updated and stored_updated and updated <= stored_updated:
                 logger.info("Skipping %s — not modified since last ingest", ticket_key)
                 return existing
 
-    # Fetch ticket
-    ticket_data = await jira_client.get_ticket_data(ticket_key)
+    # Pre-download attachment bytes asynchronously before entering the sync
+    # assembly path.  Triage (layer0/1 scoring) is free, so we only download
+    # the top candidates identified by those cheap layers.
+    from .triage import layer0_filter, layer1_score
 
-    # Build download function for triage (wraps the async client in a sync callable)
-    import asyncio
+    _prefetched: dict[str, bytes] = {}
+    _attachments = ticket_data.get("attachments", [])
+    _candidates = layer1_score(layer0_filter(_attachments))[:5]
+    for _att in _candidates:
+        _att_id = str(_att.get("id") or _att.get("filename", ""))
+        try:
+            _prefetched[_att_id] = await jira_client.download_attachment(_att)
+        except Exception as _exc:
+            logger.warning("Pre-fetch failed for %s: %s", _att.get("filename"), _exc)
 
-    def sync_download(att: dict) -> bytes:
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(jira_client.download_attachment(att))
+    def cached_download(att: dict) -> bytes:
+        """Sync download shim backed by pre-fetched bytes — no event-loop bridging."""
+        att_id = str(att.get("id") or att.get("filename", ""))
+        cached = _prefetched.get(att_id)
+        if cached is not None:
+            return cached
+        raise RuntimeError(
+            f"Bytes not pre-fetched for attachment '{att.get('filename')}'. "
+            "This attachment was not among the top-scored Layer-1 candidates."
+        )
 
     # Assemble document
     document = assemble_document(
         ticket_data=ticket_data,
-        download_fn=sync_download,
+        download_fn=cached_download,
         llm_client=llm_client,
         embedding_client=embedding_client,
         dict_path=dict_path,
@@ -90,7 +111,7 @@ async def ingest_ticket(
     if storage_dir:
         from .storage import DocumentStore
         store = DocumentStore(output_dir=storage_dir)
-        store.save(document, fmt=storage_fmt)  # type: ignore[arg-type]
+        store.save(document, fmt=storage_fmt)
 
     # Index
     from .indexing import index_retrieval_view, index_supervision_view
@@ -323,6 +344,7 @@ def assemble_document(
         "observed": {
             "quality_tier": quality_tier,
             "created": meta.get("created", ""),
+            "updated_at": fields.get("updated", ""),
             "content_source": content_source or "none",
             "triage": {
                 "primary_attachment": primary["filename"] if primary else None,

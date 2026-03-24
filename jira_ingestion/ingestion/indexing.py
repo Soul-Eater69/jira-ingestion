@@ -240,6 +240,8 @@ def index_retrieval_view(
         "quality_tier": obs["quality_tier"],
         "content_source": obs["content_source"],
         "created": obs.get("created", ""),
+        "updated_at": obs.get("updated_at", ""),   # used by idempotency check
+        "ingested_at": document.get("ingested_at", ""),
         "business_unit": obs["metadata"].get("business_unit") or "",
         "chunk_count": obs["stats"]["chunk_count"],
         "entity_product_count": len(obs["entity_mentions"].get("products", [])),
