@@ -54,6 +54,10 @@ class DocumentStore:
         self.output_dir = Path(output_dir)
         self.save_embeddings = save_embeddings
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        # Lineage sub-directories — created lazily on first write
+        self._raw_dir = self.output_dir / "_raw"
+        self._extracted_dir = self.output_dir / "_extracted"
+        self._debug_dir = self.output_dir / "_debug"
 
     # ------------------------------------------------------------------
     # Save
@@ -201,6 +205,46 @@ class DocumentStore:
                     yield doc
                 except json.JSONDecodeError as exc:
                     logger.warning("Skipping malformed JSONL line: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Lineage / debug artifact persistence
+    # ------------------------------------------------------------------
+
+    def save_raw_ticket(self, ticket_key: str, ticket_data: dict) -> Path:
+        """
+        Persist the raw Jira API payload for a ticket.
+
+        Layout: <output_dir>/_raw/<ticket_key>.raw.json
+        """
+        self._raw_dir.mkdir(parents=True, exist_ok=True)
+        path = self._raw_dir / f"{ticket_key}.raw.json"
+        _write_json(path, ticket_data)
+        logger.debug("Saved raw ticket → %s", path)
+        return path
+
+    def save_extracted_attachments(self, ticket_key: str, extracted: list[dict]) -> Path:
+        """
+        Persist extracted attachment text artifacts.
+
+        Layout: <output_dir>/_extracted/<ticket_key>.attachments.extracted.json
+        """
+        self._extracted_dir.mkdir(parents=True, exist_ok=True)
+        path = self._extracted_dir / f"{ticket_key}.attachments.extracted.json"
+        _write_json(path, extracted)
+        logger.debug("Saved extracted attachments → %s", path)
+        return path
+
+    def save_debug_stage(self, ticket_key: str, stage: str, payload: Any) -> Path:
+        """
+        Persist a named debug artifact for a pipeline stage.
+
+        Layout: <output_dir>/_debug/<ticket_key>.<stage>.json
+        """
+        self._debug_dir.mkdir(parents=True, exist_ok=True)
+        path = self._debug_dir / f"{ticket_key}.{stage}.json"
+        _write_json(path, payload)
+        logger.debug("Saved debug stage %r → %s", stage, path)
+        return path
 
     # ------------------------------------------------------------------
     # Utilities
