@@ -5,6 +5,12 @@ Layer 0: Extension + size filter  (free — API metadata only)
 Layer 1: Filename heuristic scoring  (free — string parsing)
 Layer 2: Cheap metadata peek  (cheap — 100-200ms, no full parsing)
 Layer 3: Full extraction + confirmation  (moderate — only the winner)
+
+After Layer 3, multi-dimensional triage scores are computed:
+  extraction_quality   — native text vs OCR, readability, formatting
+  semantic_density     — business/process signal density
+  idea_card_likeness   — problem/solution/value structure match
+  retrieval_readiness  — usefulness for value stream / product prediction
 """
 
 from __future__ import annotations
@@ -63,6 +69,39 @@ _TEMPLATE_PHRASES = [
     "click to add", "type here", "[your text]",
     "add title", "add text",
 ]
+
+# ---------------------------------------------------------------------------
+# Multi-dimensional scoring signals
+# ---------------------------------------------------------------------------
+
+_PROBLEM_RE = re.compile(
+    r"\b(problem|challenge|pain point|issue|opportunity|gap|need|friction)\b",
+    re.IGNORECASE,
+)
+_SOLUTION_RE = re.compile(
+    r"\b(solution|proposal|approach|recommendation|initiative|implement|resolve)\b",
+    re.IGNORECASE,
+)
+_VALUE_RE = re.compile(
+    r"\b(value|benefit|roi|return|saving|revenue|cost reduction|efficiency|impact)\b",
+    re.IGNORECASE,
+)
+_EXEC_SUMMARY_RE = re.compile(
+    r"\b(executive summary|overview|background|objective|scope|deliverable|goal)\b",
+    re.IGNORECASE,
+)
+_METRIC_RE = re.compile(
+    r"(\d+\s*%|\$\s*\d+|\bkpi\b|\bmetric\b|\btarget\b|\bmeasure\b)",
+    re.IGNORECASE,
+)
+_WORKFLOW_RE = re.compile(
+    r"\b(process|workflow|stage|step|phase|milestone|deploy|release|sprint|pipeline)\b",
+    re.IGNORECASE,
+)
+_BUSINESS_RE = re.compile(
+    r"\b(business|customer|stakeholder|market|product|service|platform|capability|function)\b",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +167,7 @@ def triage_attachments(
         peek_candidates = layer2_peek(peek_candidates, download_fn)
         peek_candidates.sort(key=lambda x: x["triage_score"], reverse=True)
 
-    # Layer 3 — full extraction + confirmation
+    # Layer 3 — full extraction + confirmation + multi-dimensional scoring
     for candidate in peek_candidates:
         try:
             file_bytes = download_fn(candidate)
@@ -136,6 +175,9 @@ def triage_attachments(
             if confirm_is_idea_card(extracted):
                 candidate["file_bytes"] = file_bytes
                 candidate["confirmed"] = True
+                candidate["triage_scores"] = compute_triage_scores(
+                    extracted.get("text", ""), candidate.get("ext", "")
+                )
                 supp = [
                     s for s in scored
                     if s is not candidate and s["triage_score"] >= 15
@@ -151,8 +193,13 @@ def triage_attachments(
         if "file_bytes" not in winner:
             winner["file_bytes"] = download_fn(winner)
         winner["confirmed"] = False
+        # Still compute scores from whatever text we extracted
+        extracted_fallback = _full_extract_text(winner["file_bytes"], winner.get("ext", ""))
+        winner["triage_scores"] = compute_triage_scores(
+            extracted_fallback.get("text", ""), winner.get("ext", "")
+        )
     except Exception:
-        pass
+        winner.setdefault("triage_scores", {})
 
     supp = [s for s in scored[1:3] if s["triage_score"] >= 15]
     return winner, supp, "fallback"
@@ -310,6 +357,101 @@ def confirm_is_idea_card(extracted: Optional[dict]) -> bool:
     if non_bp_count < 2:
         return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Multi-dimensional triage scores (computed after full extraction)
+# ---------------------------------------------------------------------------
+
+def compute_triage_scores(text: str, ext: str = "") -> dict:
+    """
+    Compute multi-dimensional triage scores from extracted document text.
+
+    All returned values are floats in [0.0, 1.0].
+
+    Args:
+        text: Full extracted text of the attachment.
+        ext:  File extension (pptx/pdf/docx/…) — affects extraction_quality baseline.
+
+    Returns:
+        Dict with keys: extraction_quality, semantic_density,
+        idea_card_likeness, retrieval_readiness.
+    """
+    if not text:
+        return {
+            "extraction_quality": 0.0,
+            "semantic_density": 0.0,
+            "idea_card_likeness": 0.0,
+            "retrieval_readiness": 0.0,
+        }
+
+    words = text.split()
+    word_count = len(words)
+
+    if word_count < 20:
+        return {
+            "extraction_quality": 0.1,
+            "semantic_density": 0.0,
+            "idea_card_likeness": 0.0,
+            "retrieval_readiness": 0.0,
+        }
+
+    # --- extraction_quality ---
+    # Baseline by file type (native text vs likely-OCR)
+    if ext in ("pptx", "ppt", "docx", "doc"):
+        type_baseline = 0.95
+    elif ext == "pdf":
+        type_baseline = 0.85
+    else:
+        type_baseline = 0.70
+
+    # Penalise template boilerplate
+    text_lower = text.lower()
+    template_hits = sum(1 for p in _TEMPLATE_PHRASES if p in text_lower)
+    formatting_penalty = min(template_hits * 0.1, 0.4)
+
+    # Reward high ratio of alphabetic words (readability proxy)
+    alpha_ratio = sum(1 for w in words if any(c.isalpha() for c in w)) / word_count
+    readability = alpha_ratio * 0.8 + 0.2
+
+    extraction_quality = type_baseline * readability * (1.0 - formatting_penalty)
+
+    # --- semantic_density ---
+    # Business and workflow signal per 100 words
+    business_hits = len(_BUSINESS_RE.findall(text))
+    workflow_hits = len(_WORKFLOW_RE.findall(text))
+    per100 = max(word_count / 100, 1)
+    business_density = min(business_hits / per100, 3.0) / 3.0
+    workflow_density = min(workflow_hits / per100, 3.0) / 3.0
+    semantic_density = business_density * 0.6 + workflow_density * 0.4
+
+    # --- idea_card_likeness ---
+    has_problem = bool(_PROBLEM_RE.search(text))
+    has_solution = bool(_SOLUTION_RE.search(text))
+    has_value = bool(_VALUE_RE.search(text))
+    has_exec = bool(_EXEC_SUMMARY_RE.search(text))
+    has_metrics = bool(_METRIC_RE.search(text))
+    idea_card_likeness = (
+        has_problem * 0.25
+        + has_solution * 0.25
+        + has_value * 0.20
+        + has_exec * 0.15
+        + has_metrics * 0.15
+    )
+
+    # --- retrieval_readiness ---
+    length_score = min(word_count / 300, 1.0)
+    noise_score = 1.0 - min(template_hits * 0.15, 0.6)
+    retrieval_readiness = (
+        length_score * 0.4 + semantic_density * 0.3 + idea_card_likeness * 0.3
+    ) * noise_score
+
+    return {
+        "extraction_quality": round(extraction_quality, 3),
+        "semantic_density": round(min(semantic_density, 1.0), 3),
+        "idea_card_likeness": round(idea_card_likeness, 3),
+        "retrieval_readiness": round(min(retrieval_readiness, 1.0), 3),
+    }
 
 
 # ---------------------------------------------------------------------------

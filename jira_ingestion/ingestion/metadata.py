@@ -98,10 +98,25 @@ def extract_metadata(
     priority = (fields.get("priority") or {}).get("name", "")
     epic_key = _get_epic_key(fields, jira_field_map)
 
-    # Tier 3 — comments (first 2-3 substantive ones)
-    substantive_comments = _extract_comments(fields.get("comment") or {})
+    # Tier 2b — standard Jira fields (issue type, status, resolution)
+    issue_type = (fields.get("issuetype") or {}).get("name", "")
+    status = (fields.get("status") or {}).get("name", "")
+    resolution = (fields.get("resolution") or {}).get("name", "")
 
-    # Build metadata text for BM25 + embedding
+    # Tier 2c — organisational fields
+    requesting_org = _as_text(
+        _resolve_field(fields, jira_field_map.get("requesting_org", "customfield_10102"))
+    )
+    delivery_org = _as_text(
+        _resolve_field(fields, jira_field_map.get("delivery_org", "customfield_10103"))
+    )
+
+    # Tier 3 — comments (first 2-3 substantive ones for chunk use)
+    substantive_comments = _extract_substantive_comments(fields.get("comment") or {})
+
+    # Build metadata text for BM25 + embedding.
+    # NOTE: VS labels / impacted products are NOT included here —
+    # they go to the supervision view only (no label leakage into retrieval text).
     meta_parts: list[str] = [f"{ticket_key}: {summary}"]
     if components:
         meta_parts.append(f"Components: {', '.join(components)}")
@@ -113,6 +128,12 @@ def extract_metadata(
         meta_parts.append(f"Product Area: {product_area}")
     if reporter:
         meta_parts.append(f"Reporter: {reporter}")
+    if issue_type:
+        meta_parts.append(f"Type: {issue_type}")
+    if status:
+        meta_parts.append(f"Status: {status}")
+    if requesting_org:
+        meta_parts.append(f"Requesting Org: {requesting_org}")
 
     return {
         "ticket_key": ticket_key,
@@ -125,11 +146,88 @@ def extract_metadata(
         "business_unit": business_unit,
         "product_area": product_area,
         "priority": priority,
+        "issue_type": issue_type,
+        "status": status,
+        "resolution": resolution,
+        "requesting_org": requesting_org,
+        "delivery_org": delivery_org,
         "epic_key": epic_key,
         "substantive_comments": substantive_comments,
         "metadata_text": ". ".join(meta_parts),
         # classified_links is set separately by classify_links()
     }
+
+
+def extract_all_comments(ticket_fields: dict) -> list[dict]:
+    """
+    Extract all comments as structured records (raw layer).
+
+    Returns a list of dicts with keys: comment_id, author, created_at,
+    body_raw, body_cleaned, word_count, is_substantive.
+    """
+    comment_container = ticket_fields.get("comment") or {}
+    comments_list = comment_container.get("comments", [])
+    bot_patterns = ["atlassian-bot", "jira-bot", "automation", "webhook"]
+    records: list[dict] = []
+
+    for comment in comments_list:
+        author_obj = comment.get("author") or {}
+        author = author_obj.get("displayName", author_obj.get("name", ""))
+        author_lower = author.lower()
+        is_bot = any(p in author_lower for p in bot_patterns)
+
+        body = comment.get("body", "")
+        if isinstance(body, dict):
+            body = _extract_adf_text(body)
+        body_raw = body.strip()
+        body_cleaned = _clean_comment_text(body_raw)
+        word_count = len(body_cleaned.split())
+
+        records.append({
+            "comment_id": str(comment.get("id", "")),
+            "author": author,
+            "created_at": comment.get("created", ""),
+            "body_raw": body_raw,
+            "body_cleaned": body_cleaned[:2000],
+            "word_count": word_count,
+            "is_substantive": word_count >= 50 and not is_bot,
+        })
+
+    return records
+
+
+def extract_impacted_products(
+    ticket_fields: dict,
+    jira_field_map: dict[str, str],
+) -> tuple[list[dict], list[str], list[str]]:
+    """
+    Extract impacted products from custom fields.
+
+    Returns:
+        (raw_list, ids, names)
+    """
+    raw_value = _resolve_field(
+        ticket_fields,
+        jira_field_map.get("impacted_products", "customfield_10100"),
+    )
+    return _extract_product_list(raw_value)
+
+
+def extract_impacted_it_products(
+    ticket_fields: dict,
+    jira_field_map: dict[str, str],
+) -> tuple[list[dict], list[str], list[str]]:
+    """
+    Extract impacted IT products from custom fields.
+
+    Returns:
+        (raw_list, ids, names)
+    """
+    raw_value = _resolve_field(
+        ticket_fields,
+        jira_field_map.get("impacted_it_products", "customfield_10101"),
+    )
+    return _extract_product_list(raw_value)
 
 
 def classify_links(issuelinks: list[dict]) -> dict[str, list[dict]]:
@@ -223,7 +321,7 @@ def _get_epic_key(fields: dict, jira_field_map: dict[str, str]) -> Optional[str]
     return None
 
 
-def _extract_comments(comment_container: dict) -> list[str]:
+def _extract_substantive_comments(comment_container: dict) -> list[str]:
     """Extract first 2-3 substantive (>50 words) comments, skipping bots."""
     comments_list = comment_container.get("comments", [])
     substantive: list[str] = []
@@ -237,7 +335,6 @@ def _extract_comments(comment_container: dict) -> list[str]:
             continue
         body = comment.get("body", "")
         if isinstance(body, dict):
-            # Atlassian Document Format (ADF)
             body = _extract_adf_text(body)
         body = body.strip()
         word_count = len(body.split())
@@ -245,6 +342,18 @@ def _extract_comments(comment_container: dict) -> list[str]:
             substantive.append(body[:2000])
 
     return substantive
+
+
+def _clean_comment_text(text: str) -> str:
+    """
+    Light cleaning for comment text: strip excessive whitespace and
+    remove obvious boilerplate markers.
+    """
+    import re
+    # Collapse runs of whitespace / newlines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r" {2,}", " ", text)
+    return text.strip()
 
 
 def _extract_adf_text(adf: dict) -> str:
@@ -259,3 +368,41 @@ def _extract_adf_text(adf: dict) -> str:
         for item in adf:
             parts.append(_extract_adf_text(item))
     return " ".join(p for p in parts if p)
+
+
+def _extract_product_list(raw_value: Any) -> tuple[list[dict], list[str], list[str]]:
+    """
+    Normalise a Jira custom field value into (raw_list, ids, names).
+
+    Handles: None, str, dict (single item with id/name), list of dicts.
+    """
+    if not raw_value:
+        return [], [], []
+
+    if isinstance(raw_value, str):
+        return [{"name": raw_value}], [], [raw_value]
+
+    if isinstance(raw_value, dict):
+        item_id = str(raw_value.get("id", raw_value.get("key", "")))
+        item_name = str(raw_value.get("name", raw_value.get("value", "")))
+        return [raw_value], [item_id] if item_id else [], [item_name] if item_name else []
+
+    if isinstance(raw_value, list):
+        raw_list: list[dict] = []
+        ids: list[str] = []
+        names: list[str] = []
+        for item in raw_value:
+            if isinstance(item, dict):
+                raw_list.append(item)
+                item_id = str(item.get("id", item.get("key", "")))
+                item_name = str(item.get("name", item.get("value", "")))
+                if item_id:
+                    ids.append(item_id)
+                if item_name:
+                    names.append(item_name)
+            elif isinstance(item, str):
+                raw_list.append({"name": item})
+                names.append(item)
+        return raw_list, ids, names
+
+    return [], [], []

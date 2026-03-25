@@ -61,12 +61,28 @@ class JiraIngestionConfig:
         "sprint": "customfield_10020",
         "team": "customfield_10001",
         "epic_name": "customfield_10010",
+        # Impacted products / IT products (supervision labels — not retrieval text)
+        "impacted_products": "customfield_10100",
+        "impacted_it_products": "customfield_10101",
+        # Organisational fields
+        "requesting_org": "customfield_10102",
+        "delivery_org": "customfield_10103",
     })
 
     # --- Lineage / artifact persistence ---
     enable_raw_artifact_persistence: bool = True
     enable_attachment_text_persistence: bool = True
     enable_debug_stage_persistence: bool = False  # verbose — off by default
+
+    # --- Structured debug artifacts (numbered per-ticket JSON files) ---
+    # When True each ticket produces:
+    #   01_raw_ticket.json, 02_attachment_contents.json,
+    #   03_triage_output.json, 04_assembled_prechunk.json, 05_debug_report.json
+    enable_full_debug_artifacts: bool = False
+    # Save 03_triage_output.json independently of full debug mode
+    enable_triage_artifact_persistence: bool = False
+    # Save 04_assembled_prechunk.json independently of full debug mode
+    enable_prechunk_persistence: bool = False
 
     # --- HTTP / retry ---
     http_timeout_seconds: int = 120
