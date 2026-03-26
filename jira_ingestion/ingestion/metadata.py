@@ -116,18 +116,36 @@ def extract_product_fields(
     }
 
 
+_COMMENT_CHATTER_RE = [
+    __import__("re").compile(p, __import__("re").IGNORECASE)
+    for p in [
+        r"^(moved|transitioned|changed status|updated|assigned|resolved|closed|reopened)\b",
+        r"^(done|ok|ack|acknowledged|noted|thanks|cheers|\+1|-1|approved|lgtm)\W*$",
+        r"^\s*(see attached|see comments|see above|as per|per above|as discussed)\b",
+        r"^(sent|forwarded|cc:|fyi\b)",
+    ]
+]
+
+
 def extract_comments_enriched(comment_container: dict) -> dict:
     """
     Extract all comments with raw + cleaned representations.
 
+    Cleaning steps:
+      - Strip Jira wiki markup (reuses description cleaner)
+      - Normalize whitespace
+      - Detect and exclude trivial operational chatter
+
     Returns:
         CommentsEnriched-compatible dict with:
             - comments_raw:       list of CommentRecord dicts (all non-bot)
-            - comments_cleaned:   list of substantive comment strings
+            - comments_cleaned:   list of substantive comment strings (>= 50 words)
             - comment_count:      total non-bot comment count
             - substantive_count:  comments with >= 50 words
             - important_spans:    key sentences from substantive comments
     """
+    from .description import clean_jira_markup
+
     comments_list = (comment_container or {}).get("comments", [])
     bot_patterns = ["atlassian-bot", "jira-bot", "automation", "webhook"]
 
@@ -145,9 +163,18 @@ def extract_comments_enriched(comment_container: dict) -> dict:
         if isinstance(body, dict):
             body = _extract_adf_text(body)
         body_raw = body.strip()
-        body_cleaned = body_raw  # same here — no further cleaning at this stage
+
+        # Clean: strip Jira markup, collapse whitespace
+        body_cleaned = clean_jira_markup(body_raw) if body_raw else ""
+
+        # Exclude trivial operational chatter before counting
+        word_count_cleaned = len(body_cleaned.split())
+        is_chatter = word_count_cleaned < 10 or any(
+            p.search(body_cleaned) for p in _COMMENT_CHATTER_RE
+        )
+
         word_count = len(body_raw.split())
-        is_substantive = word_count >= 50
+        is_substantive = word_count >= 50 and not is_chatter
 
         record: dict = {
             "comment_id": comment.get("id", ""),
@@ -162,13 +189,13 @@ def extract_comments_enriched(comment_container: dict) -> dict:
 
         if is_substantive:
             comments_cleaned.append(body_cleaned[:2000])
-            # Extract first 2 sentences as important spans
+            # Key sentences: split on period, keep those >= 8 words
             sentences = [s.strip() for s in body_cleaned.split(".") if len(s.strip().split()) >= 8]
             important_spans.extend(sentences[:2])
 
     return {
         "comments_raw": comments_raw,
-        "comments_cleaned": comments_cleaned[:5],   # top 5 substantive comments
+        "comments_cleaned": comments_cleaned[:5],
         "comment_count": len(comments_raw),
         "substantive_count": sum(1 for c in comments_raw if c["is_substantive"]),
         "important_spans": important_spans[:10],
