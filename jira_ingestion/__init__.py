@@ -65,6 +65,7 @@ from jira_ingestion.ingestion.metadata import (
     classify_links,
     extract_product_fields,
     extract_comments_enriched,
+    extract_stage_labels,
 )
 from jira_ingestion.ingestion.triage import build_triage_artifact
 
@@ -109,6 +110,7 @@ __all__ = [
     "classify_links",
     "extract_product_fields",
     "extract_comments_enriched",
+    "extract_stage_labels",
     "build_triage_artifact",
     # Platform modules
     "DeadLetterQueue",

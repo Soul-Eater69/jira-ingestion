@@ -5,6 +5,7 @@ Metadata extraction and linked-issue classification.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,70 @@ LINK_TYPE_MAP: dict[str, str] = {
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+def extract_stage_labels(ticket_fields: dict, jira_field_map: dict) -> list[str]:
+    """
+    Extract product stage labels from the ticket.
+
+    Sources (in priority order):
+      1. Custom field nominated by jira_field_map["product_stage"] (if set and non-empty)
+      2. Standard fixVersions field (release/version names often carry stage info)
+      3. Standard versions field (affected versions)
+
+    Returns a deduplicated list of stage label strings.
+    """
+    fields = ticket_fields or {}
+    labels: list[str] = []
+
+    # 1. Configured custom stage field
+    stage_field_id = jira_field_map.get("product_stage", "")
+    if stage_field_id:
+        raw = _resolve_field(fields, stage_field_id)
+        if raw:
+            labels.extend(_names_from_field(raw))
+
+    # 2. fixVersions — standard Jira field for target release / stage
+    for v in fields.get("fixVersions") or []:
+        if isinstance(v, dict):
+            name = v.get("name", "")
+            if name:
+                labels.append(name)
+        elif isinstance(v, str) and v:
+            labels.append(v)
+
+    # 3. versions (affected)
+    for v in fields.get("versions") or []:
+        if isinstance(v, dict):
+            name = v.get("name", "")
+            if name:
+                labels.append(name)
+        elif isinstance(v, str) and v:
+            labels.append(v)
+
+    # Deduplicate preserving order
+    seen: set[str] = set()
+    result: list[str] = []
+    for lbl in labels:
+        if lbl not in seen:
+            seen.add(lbl)
+            result.append(lbl)
+    return result
+
+
+def _names_from_field(raw: Any) -> list[str]:
+    """Extract a list of name strings from a Jira field value."""
+    if isinstance(raw, str):
+        return [raw] if raw else []
+    if isinstance(raw, dict):
+        name = raw.get("name") or raw.get("value") or raw.get("displayName") or ""
+        return [str(name)] if name else []
+    if isinstance(raw, list):
+        out: list[str] = []
+        for item in raw:
+            out.extend(_names_from_field(item))
+        return out
+    return []
+
 
 def extract_product_fields(
     ticket_fields: dict,
@@ -117,7 +182,7 @@ def extract_product_fields(
 
 
 _COMMENT_CHATTER_RE = [
-    __import__("re").compile(p, __import__("re").IGNORECASE)
+    re.compile(p, re.IGNORECASE)
     for p in [
         r"^(moved|transitioned|changed status|updated|assigned|resolved|closed|reopened)\b",
         r"^(done|ok|ack|acknowledged|noted|thanks|cheers|\+1|-1|approved|lgtm)\W*$",

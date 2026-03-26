@@ -190,7 +190,7 @@ def assemble_document(
         derived    — LLM outputs
     """
     from jira_ingestion.config import JiraIngestionConfig
-    from .metadata import extract_metadata, classify_links, extract_product_fields, extract_comments_enriched
+    from .metadata import extract_metadata, classify_links, extract_product_fields, extract_comments_enriched, extract_stage_labels
     from .triage import triage_attachments, build_triage_artifact, layer0_filter, layer1_score
     from .description import classify_description, build_description_chunks, clean_jira_markup
     from .quality import determine_quality_tier, TIER_WEIGHTS
@@ -218,6 +218,7 @@ def assemble_document(
     # 2. Product / supervision labels (not metadata — supervision layer)
     # ------------------------------------------------------------------
     product_fields = extract_product_fields(fields, jira_field_map)
+    product_stage_labels = extract_stage_labels(fields, jira_field_map)
 
     # ------------------------------------------------------------------
     # 3. Comments — enriched (raw + cleaned)
@@ -438,7 +439,7 @@ def assemble_document(
     }
 
     # ------------------------------------------------------------------
-    # 19b. Derived layer — LLM structured outputs
+    # 19b. Derived layer — LLM structured outputs + entity signal fallback
     # ------------------------------------------------------------------
     derived = generate_derived_artifacts(
         quality_tier=quality_tier,
@@ -447,7 +448,36 @@ def assemble_document(
         llm_client=llm_client,
         model=cfg.llm_model,
     )
-    # Use ticket_summary_llm as the primary summary when LLM produced it
+
+    # Always populate ticket_summary_llm from the heuristic summary if LLM
+    # didn't produce one (ensures the field is never empty when there is content).
+    if not derived["ticket_summary_llm"] and summary_text:
+        derived["ticket_summary_llm"] = summary_text
+
+    # Augment keyword/product/entity fields from entity_mentions when the LLM
+    # did not populate them.  This gives useful signal even in no-LLM mode.
+    if not derived["capability_keywords_llm"]:
+        derived["capability_keywords_llm"] = [
+            m["term"] for m in entity_mentions.get("capabilities", [])
+        ][:8]
+    if not derived["product_mentions_llm"]:
+        derived["product_mentions_llm"] = [
+            m["term"] for m in entity_mentions.get("products", [])
+        ][:8]
+    if not derived["business_entities_llm"]:
+        # Merge components + business_unit + product_area as proxy org entities
+        ent: list[str] = []
+        bu = meta.get("business_unit", "")
+        pa = meta.get("product_area", "")
+        if bu:
+            ent.append(bu)
+        if pa:
+            ent.append(pa)
+        ent.extend(meta.get("components", []))
+        derived["business_entities_llm"] = ent[:8]
+
+    # Use ticket_summary_llm as the primary summary when LLM produced it but
+    # heuristic summary was empty.
     if derived["ticket_summary_llm"] and not summary_text:
         summary_text = derived["ticket_summary_llm"]
 
@@ -512,7 +542,7 @@ def assemble_document(
             # Product labels
             "impacted_products": product_fields["impacted_products"],
             "impacted_it_products": product_fields["impacted_it_products"],
-            "product_stage_labels": [],
+            "product_stage_labels": product_stage_labels,
             # Trainability
             "trainability": {
                 "has_gold_vs_labels": has_gold_vs,
