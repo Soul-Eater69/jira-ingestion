@@ -46,10 +46,27 @@ from jira_ingestion.models import (
     ChunkRecord,
     ClassifiedLinks,
     TicketMetadata,
+    TriageArtifact,
+    AttachmentInventoryItem,
+    RetrievalViews,
+    ProductLabels,
+    CommentRecord,
+    CommentsEnriched,
+    ProvenanceRecord,
+    RawLayer,
     ObservedDocument,
     SupervisionDocument,
+    DerivedLayer,
     PipelineDocument,
+    PreChunkDocument,
 )
+from jira_ingestion.ingestion.metadata import (
+    extract_metadata,
+    classify_links,
+    extract_product_fields,
+    extract_comments_enriched,
+)
+from jira_ingestion.ingestion.triage import build_triage_artifact
 
 __all__ = [
     # Core pipeline
@@ -74,9 +91,25 @@ __all__ = [
     "ChunkRecord",
     "ClassifiedLinks",
     "TicketMetadata",
+    "TriageArtifact",
+    "AttachmentInventoryItem",
+    "RetrievalViews",
+    "ProductLabels",
+    "CommentRecord",
+    "CommentsEnriched",
+    "ProvenanceRecord",
+    "RawLayer",
     "ObservedDocument",
     "SupervisionDocument",
+    "DerivedLayer",
     "PipelineDocument",
+    "PreChunkDocument",
+    # Metadata helpers
+    "extract_metadata",
+    "classify_links",
+    "extract_product_fields",
+    "extract_comments_enriched",
+    "build_triage_artifact",
     # Platform modules
     "DeadLetterQueue",
     "RetryPolicy",

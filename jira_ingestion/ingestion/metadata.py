@@ -54,6 +54,127 @@ LINK_TYPE_MAP: dict[str, str] = {
 # Public API
 # ---------------------------------------------------------------------------
 
+def extract_product_fields(
+    ticket_fields: dict,
+    jira_field_map: dict,
+) -> dict:
+    """
+    Extract impacted product and IT product labels from Jira custom fields.
+
+    Returns a dict safe for the supervision layer — these are labels,
+    not retrieval text.
+
+    Args:
+        ticket_fields:  The 'fields' dict from the Jira API response.
+        jira_field_map: Mapping of logical names to customfield_* IDs.
+
+    Returns:
+        {
+            "impacted_products":    ProductLabels,
+            "impacted_it_products": ProductLabels,
+            "requesting_org":       str,
+            "delivery_org":         str,
+        }
+    """
+    fields = ticket_fields or {}
+
+    def _extract_label_list(field_id: Optional[str]) -> dict:
+        """Extract a list-of-objects field into raw/ids/names."""
+        raw = _resolve_field(fields, field_id) if field_id else None
+        if not raw:
+            return {"raw": [], "ids": [], "names": []}
+        if not isinstance(raw, list):
+            raw = [raw]
+        ids: list[str] = []
+        names: list[str] = []
+        for item in raw:
+            if isinstance(item, dict):
+                item_id = str(item.get("id") or item.get("key") or "")
+                item_name = str(item.get("name") or item.get("value") or item.get("displayName") or "")
+            elif isinstance(item, str):
+                item_id = ""
+                item_name = item
+            else:
+                item_id = ""
+                item_name = str(item)
+            if item_id:
+                ids.append(item_id)
+            if item_name:
+                names.append(item_name)
+        return {"raw": raw, "ids": ids, "names": names}
+
+    impacted_products_field = jira_field_map.get("impacted_products")
+    impacted_it_products_field = jira_field_map.get("impacted_it_products")
+    requesting_org_field = jira_field_map.get("requesting_org")
+    delivery_org_field = jira_field_map.get("delivery_org")
+
+    return {
+        "impacted_products": _extract_label_list(impacted_products_field),
+        "impacted_it_products": _extract_label_list(impacted_it_products_field),
+        "requesting_org": _as_text(_resolve_field(fields, requesting_org_field)),
+        "delivery_org": _as_text(_resolve_field(fields, delivery_org_field)),
+    }
+
+
+def extract_comments_enriched(comment_container: dict) -> dict:
+    """
+    Extract all comments with raw + cleaned representations.
+
+    Returns:
+        CommentsEnriched-compatible dict with:
+            - comments_raw:       list of CommentRecord dicts (all non-bot)
+            - comments_cleaned:   list of substantive comment strings
+            - comment_count:      total non-bot comment count
+            - substantive_count:  comments with >= 50 words
+            - important_spans:    key sentences from substantive comments
+    """
+    comments_list = (comment_container or {}).get("comments", [])
+    bot_patterns = ["atlassian-bot", "jira-bot", "automation", "webhook"]
+
+    comments_raw: list[dict] = []
+    comments_cleaned: list[str] = []
+    important_spans: list[str] = []
+
+    for comment in comments_list:
+        author_obj = comment.get("author") or {}
+        author = author_obj.get("displayName", author_obj.get("name", ""))
+        if any(p in author.lower() for p in bot_patterns):
+            continue
+
+        body = comment.get("body", "")
+        if isinstance(body, dict):
+            body = _extract_adf_text(body)
+        body_raw = body.strip()
+        body_cleaned = body_raw  # same here — no further cleaning at this stage
+        word_count = len(body_raw.split())
+        is_substantive = word_count >= 50
+
+        record: dict = {
+            "comment_id": comment.get("id", ""),
+            "author": author,
+            "created": comment.get("created", ""),
+            "body_raw": body_raw,
+            "body_cleaned": body_cleaned,
+            "word_count": word_count,
+            "is_substantive": is_substantive,
+        }
+        comments_raw.append(record)
+
+        if is_substantive:
+            comments_cleaned.append(body_cleaned[:2000])
+            # Extract first 2 sentences as important spans
+            sentences = [s.strip() for s in body_cleaned.split(".") if len(s.strip().split()) >= 8]
+            important_spans.extend(sentences[:2])
+
+    return {
+        "comments_raw": comments_raw,
+        "comments_cleaned": comments_cleaned[:5],   # top 5 substantive comments
+        "comment_count": len(comments_raw),
+        "substantive_count": sum(1 for c in comments_raw if c["is_substantive"]),
+        "important_spans": important_spans[:10],
+    }
+
+
 def extract_metadata(
     ticket_fields: dict,
     ticket_key: str,
@@ -87,6 +208,9 @@ def extract_metadata(
     components: list[str] = [
         c.get("name", "") for c in (fields.get("components") or []) if isinstance(c, dict)
     ]
+    issue_type = (fields.get("issuetype") or {}).get("name", "")
+    status = (fields.get("status") or {}).get("name", "")
+    resolution = (fields.get("resolution") or {}).get("name", "")
 
     # Tier 2 — config-driven custom fields (deterministic, not heuristic)
     business_unit = _as_text(
@@ -95,14 +219,24 @@ def extract_metadata(
     product_area = _as_text(
         _resolve_field(fields, jira_field_map.get("product_area", "customfield_10003"))
     )
+    requesting_org = _as_text(
+        _resolve_field(fields, jira_field_map.get("requesting_org"))
+    )
+    delivery_org = _as_text(
+        _resolve_field(fields, jira_field_map.get("delivery_org"))
+    )
     priority = (fields.get("priority") or {}).get("name", "")
     epic_key = _get_epic_key(fields, jira_field_map)
 
-    # Tier 3 — comments (first 2-3 substantive ones)
+    # Tier 3 — comments (backward-compat: top-3 substantive strings)
     substantive_comments = _extract_comments(fields.get("comment") or {})
 
-    # Build metadata text for BM25 + embedding
+    # Build metadata text for BM25 + embedding (retrieval-safe — no label leakage)
     meta_parts: list[str] = [f"{ticket_key}: {summary}"]
+    if issue_type:
+        meta_parts.append(f"Type: {issue_type}")
+    if status:
+        meta_parts.append(f"Status: {status}")
     if components:
         meta_parts.append(f"Components: {', '.join(components)}")
     if labels:
@@ -111,6 +245,10 @@ def extract_metadata(
         meta_parts.append(f"Business Unit: {business_unit}")
     if product_area:
         meta_parts.append(f"Product Area: {product_area}")
+    if requesting_org:
+        meta_parts.append(f"Requesting Org: {requesting_org}")
+    if delivery_org:
+        meta_parts.append(f"Delivery Org: {delivery_org}")
     if reporter:
         meta_parts.append(f"Reporter: {reporter}")
 
@@ -122,8 +260,13 @@ def extract_metadata(
         "created": created,
         "labels": labels,
         "components": components,
+        "issue_type": issue_type,
+        "status": status,
+        "resolution": resolution,
         "business_unit": business_unit,
         "product_area": product_area,
+        "requesting_org": requesting_org,
+        "delivery_org": delivery_org,
         "priority": priority,
         "epic_key": epic_key,
         "substantive_comments": substantive_comments,

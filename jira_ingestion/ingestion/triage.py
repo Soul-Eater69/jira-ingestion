@@ -1,10 +1,18 @@
 """
-Four-layer attachment triage funnel.
+Four-layer attachment triage funnel + multi-score triage artifact.
 
 Layer 0: Extension + size filter  (free — API metadata only)
 Layer 1: Filename heuristic scoring  (free — string parsing)
 Layer 2: Cheap metadata peek  (cheap — 100-200ms, no full parsing)
 Layer 3: Full extraction + confirmation  (moderate — only the winner)
+
+build_triage_artifact() assembles the first-class triage output with:
+  - primary / supplementary decision
+  - quality tier
+  - selection reason
+  - multi-dimensional scores (extraction_quality, semantic_density,
+    idea_card_likeness, retrieval_readiness)
+  - per-attachment score breakdown
 """
 
 from __future__ import annotations
@@ -310,6 +318,200 @@ def confirm_is_idea_card(extracted: Optional[dict]) -> bool:
     if non_bp_count < 2:
         return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Layer 3 helper: lightweight full-text extraction for confirmation
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Multi-score triage artifact (first-class stage output)
+# ---------------------------------------------------------------------------
+
+def build_triage_artifact(
+    primary: Optional[dict],
+    supplementary: list[dict],
+    att_quality: str,
+    all_scored: list[dict],
+    total_attachment_count: int = 0,
+) -> dict:
+    """
+    Build a structured triage artifact from the triage funnel result.
+
+    This is the persisted output of the triage stage (03_triage_output.json).
+    All downstream layers consume this artifact instead of raw triage state.
+
+    Args:
+        primary:                 Winning attachment dict (enriched by triage) or None.
+        supplementary:           Runner-up attachment dicts.
+        att_quality:             'good' | 'fallback' | 'none'.
+        all_scored:              All Layer-1 scored candidates.
+        total_attachment_count:  Total attachments on the ticket (pre-filter).
+
+    Returns:
+        TriageArtifact-compatible dict.
+    """
+    viable_count = len(all_scored)
+
+    # Build per-attachment score breakdown
+    per_att: list[dict] = []
+    for att in all_scored:
+        scores = _compute_att_scores(att)
+        per_att.append({
+            "filename": att.get("filename", ""),
+            "attachment_id": str(att.get("id", "")),
+            "ext": att.get("ext", ""),
+            "size": att.get("size", 0),
+            "triage_score": att.get("triage_score", 0),
+            "triage_reasons": att.get("triage_reasons", []),
+            "confirmed": att.get("confirmed", False),
+            "scores": scores,
+        })
+
+    # Aggregate scores for the primary attachment
+    if primary:
+        primary_scores = _compute_att_scores(primary)
+    else:
+        primary_scores = {
+            "extraction_quality": 0.0,
+            "semantic_density": 0.0,
+            "idea_card_likeness": 0.0,
+            "retrieval_readiness": 0.0,
+        }
+
+    # Derive quality tier from att_quality + primary scores
+    quality_tier = _derive_quality_tier(att_quality, primary, primary_scores)
+
+    # Build human-readable selection reason
+    selection_reason = _build_selection_reason(primary, att_quality, primary_scores)
+
+    return {
+        "primary_attachment": primary["filename"] if primary else None,
+        "primary_attachment_id": str(primary.get("id", "")) if primary else None,
+        "supplementary_attachments": [s["filename"] for s in supplementary],
+        "att_quality": att_quality,
+        "quality_tier": quality_tier,
+        "selection_reason": selection_reason,
+        "scores": primary_scores,
+        "per_attachment_scores": per_att,
+        "attachment_count_total": total_attachment_count,
+        "attachment_count_viable": viable_count,
+        # Backward compat with v2.0 schema
+        "triage_score": primary.get("triage_score") if primary else None,
+        "triage_reasons": primary.get("triage_reasons", []) if primary else [],
+    }
+
+
+def _compute_att_scores(att: dict) -> dict:
+    """
+    Compute multi-dimensional scores for one attachment using available signals.
+
+    These are proxy scores based on triage metadata (no full text analysis).
+    They capture what we know at triage time about each file.
+
+    Scores:
+        extraction_quality   — how cleanly can text be extracted?
+        semantic_density     — how likely is it to contain business signal?
+        idea_card_likeness   — how likely is it the primary idea card?
+        retrieval_readiness  — how useful for value-stream retrieval?
+    """
+    ext = att.get("ext", "").lower()
+    triage_score = att.get("triage_score", 0)
+    confirmed = att.get("confirmed", False)
+    peek = att.get("peek_metadata", {})
+    size = att.get("size", 0)
+
+    # --- extraction_quality ---
+    # pptx/docx have native XML text = high quality
+    # pdf can be native or scanned (treat as moderate without OCR info)
+    ext_quality = {"pptx": 0.90, "ppt": 0.85, "docx": 0.90, "doc": 0.85, "pdf": 0.70, "xlsx": 0.50, "csv": 0.40}
+    extraction_quality = ext_quality.get(ext, 0.50)
+    if peek.get("is_likely_template"):
+        extraction_quality *= 0.6
+    if ext == "pdf" and size > 500_000:
+        # Large PDFs often have native text
+        extraction_quality = min(0.85, extraction_quality + 0.10)
+
+    # --- semantic_density ---
+    # Normalize triage score to 0-1; min=0, reasonable max=100
+    semantic_density = max(0.0, min(1.0, triage_score / 100.0))
+    if peek.get("is_likely_idea_card"):
+        semantic_density = min(1.0, semantic_density + 0.20)
+    slide_count = peek.get("slide_count") or 0
+    if slide_count and slide_count > 60:
+        semantic_density = max(0.0, semantic_density - 0.10)
+
+    # --- idea_card_likeness ---
+    if confirmed:
+        idea_card_likeness = 0.90
+    elif peek.get("is_likely_idea_card"):
+        idea_card_likeness = 0.70
+    elif triage_score >= 40:
+        idea_card_likeness = 0.55
+    elif triage_score >= 20:
+        idea_card_likeness = 0.35
+    else:
+        idea_card_likeness = 0.15
+
+    # Boost pptx — most idea cards are decks
+    if ext in ("pptx", "ppt"):
+        idea_card_likeness = min(1.0, idea_card_likeness + 0.05)
+
+    # --- retrieval_readiness ---
+    # Combination of the above — an attachment is retrieval-ready if it has
+    # good extraction + semantic content + is likely the idea card
+    retrieval_readiness = round(
+        0.30 * extraction_quality
+        + 0.30 * semantic_density
+        + 0.40 * idea_card_likeness,
+        4,
+    )
+
+    return {
+        "extraction_quality": round(extraction_quality, 4),
+        "semantic_density": round(semantic_density, 4),
+        "idea_card_likeness": round(idea_card_likeness, 4),
+        "retrieval_readiness": round(retrieval_readiness, 4),
+    }
+
+
+def _derive_quality_tier(att_quality: str, primary: Optional[dict], scores: dict) -> str:
+    """Map triage result to a quality tier label for the triage artifact."""
+    if not primary or att_quality == "none":
+        return "none"
+    if att_quality == "good":
+        return "A"
+    # fallback — differentiate on score
+    if scores.get("retrieval_readiness", 0) >= 0.55:
+        return "B"
+    return "C"
+
+
+def _build_selection_reason(primary: Optional[dict], att_quality: str, scores: dict) -> str:
+    """Build a human-readable explanation of why the primary was selected."""
+    if not primary:
+        return "No viable attachments found after extension and size filtering."
+    filename = primary.get("filename", "")
+    reasons = primary.get("triage_reasons", [])
+    top_reasons = "; ".join(reasons[:3]) if reasons else "filename heuristic scoring"
+    confirmed = primary.get("confirmed", False)
+
+    if att_quality == "good" and confirmed:
+        return (
+            f"'{filename}' selected as primary — confirmed idea card structure. "
+            f"Scoring signals: {top_reasons}."
+        )
+    if att_quality == "good":
+        return (
+            f"'{filename}' selected as primary — passed all triage layers. "
+            f"Scoring signals: {top_reasons}."
+        )
+    rr = scores.get("retrieval_readiness", 0)
+    return (
+        f"'{filename}' selected as fallback primary (quality tier={_derive_quality_tier(att_quality, primary, scores)}, "
+        f"retrieval_readiness={rr:.2f}). "
+        f"Scoring signals: {top_reasons}."
+    )
 
 
 # ---------------------------------------------------------------------------

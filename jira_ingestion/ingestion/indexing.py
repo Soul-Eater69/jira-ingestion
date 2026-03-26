@@ -232,12 +232,15 @@ def index_retrieval_view(
 ) -> None:
     """
     Index the observed (retrieval) view of the document.
-    NO label fields are stored in any retrieval index.
+    NO supervision labels are stored in any retrieval index.
+
+    Compatible with schema v2.0 and v3.0.
     """
     ticket_key = document["ticket_key"]
     obs = document["observed"]
 
     # --- Coarse index (deck-level) ---
+    prov = obs.get("provenance", {})
     coarse_meta = {
         "quality_tier": obs["quality_tier"],
         "content_source": obs["content_source"],
@@ -248,12 +251,19 @@ def index_retrieval_view(
         "chunk_count": obs["stats"]["chunk_count"],
         "entity_product_count": len(obs["entity_mentions"].get("products", [])),
         "entity_capability_count": len(obs["entity_mentions"].get("capabilities", [])),
+        # v3.0 provenance fields
+        "has_primary_attachment": prov.get("has_primary_attachment", False),
+        "has_description": prov.get("has_description", False),
+        "source_quality_score": prov.get("source_quality_score", 0.0),
+        "primary_evidence_type": prov.get("primary_evidence_type", ""),
     }
+    # Use retrieval_text if available (v3.0), else fall back to summary+metadata
+    coarse_text = obs.get("retrieval_text") or f"{obs['summary_text']} {obs['metadata_text']}"
     coarse_index.upsert(
         id=ticket_key,
         vector=obs["summary_embedding"],
         metadata=coarse_meta,
-        text=f"{obs['summary_text']} {obs['metadata_text']}",
+        text=coarse_text,
     )
 
     # --- Fine index (chunk-level) ---
@@ -270,7 +280,7 @@ def index_retrieval_view(
             "has_table": chunk.get("has_table", False),
             "parent_ticket": ticket_key,
             "parent_quality_tier": obs["quality_tier"],
-            # NO vs_labels here — spec Section 13.2
+            # NO supervision labels here
         }
         fine_index.upsert(
             id=f"{ticket_key}/{chunk['chunk_id']}",
@@ -293,6 +303,11 @@ def index_retrieval_view(
             "business_unit": obs["metadata"].get("business_unit", ""),
             "summary_text": obs["summary_text"],
             "entity_terms": entity_terms,
+            # v3.0 extras
+            "issue_type": obs["metadata"].get("issue_type", ""),
+            "status": obs["metadata"].get("status", ""),
+            "requesting_org": obs["metadata"].get("requesting_org", ""),
+            "delivery_org": obs["metadata"].get("delivery_org", ""),
         },
     )
 
@@ -304,6 +319,8 @@ def index_supervision_view(
     """
     Index ground-truth labels in the supervision store.
     This store is NEVER accessed during retrieval.
+
+    Compatible with schema v2.0 and v3.0.
     """
     ticket_key = document["ticket_key"]
     sup = document["supervision"]
@@ -311,11 +328,18 @@ def index_supervision_view(
     supervision_store.upsert(
         id=ticket_key,
         data={
-            "vs_labels": sup["vs_labels"],
-            "vs_label_source": sup["vs_label_source"],
-            "product_stage_labels": sup.get("product_stage_labels", []),
-            "impacted_products": sup.get("impacted_products", []),
+            # Value stream labels
+            "vs_labels": sup.get("vs_labels", []),
+            "vs_label_source": sup.get("vs_label_source", ""),
+            "linked_value_stream_ids": sup.get("linked_value_stream_ids", []),
+            "linked_value_stream_names": sup.get("linked_value_stream_names", []),
+            "linked_value_stream_statuses": sup.get("linked_value_stream_statuses", []),
+            # Product labels (v3.0)
+            "impacted_products": sup.get("impacted_products", {"raw": [], "ids": [], "names": []}),
+            "impacted_it_products": sup.get("impacted_it_products", {"raw": [], "ids": [], "names": []}),
+            # v2.0 backward compat
             "impacted_products_source": sup.get("impacted_products_source"),
+            "product_stage_labels": sup.get("product_stage_labels", []),
             "trainability": sup["trainability"],
         },
     )

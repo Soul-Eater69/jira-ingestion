@@ -210,6 +210,30 @@ class DocumentStore:
     # Lineage / debug artifact persistence
     # ------------------------------------------------------------------
 
+    def save_pipeline_artifact(
+        self, ticket_key: str, step_num: int, step_name: str, payload: Any
+    ) -> Path:
+        """
+        Persist a numbered pipeline debug artifact.
+
+        Layout: <output_dir>/_debug/<ticket_key>/<step_num:02d>_<step_name>.json
+
+        Standard steps:
+            01_raw_ticket.json
+            02_attachment_contents.json
+            03_triage_output.json
+            04_assembled_prechunk.json
+            05_debug_report.json
+        """
+        self._debug_dir.mkdir(parents=True, exist_ok=True)
+        ticket_dir = self._debug_dir / ticket_key
+        ticket_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{step_num:02d}_{step_name}.json"
+        path = ticket_dir / filename
+        _write_json(path, payload)
+        logger.debug("Saved pipeline artifact → %s", path)
+        return path
+
     def save_raw_ticket(self, ticket_key: str, ticket_data: dict) -> Path:
         """
         Persist the raw Jira API payload for a ticket.
