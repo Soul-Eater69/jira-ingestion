@@ -5,6 +5,7 @@ Metadata extraction and linked-issue classification.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,70 @@ LINK_TYPE_MAP: dict[str, str] = {
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+def extract_stage_labels(ticket_fields: dict, jira_field_map: dict) -> list[str]:
+    """
+    Extract product stage labels from the ticket.
+
+    Sources (in priority order):
+      1. Custom field nominated by jira_field_map["product_stage"] (if set and non-empty)
+      2. Standard fixVersions field (release/version names often carry stage info)
+      3. Standard versions field (affected versions)
+
+    Returns a deduplicated list of stage label strings.
+    """
+    fields = ticket_fields or {}
+    labels: list[str] = []
+
+    # 1. Configured custom stage field
+    stage_field_id = jira_field_map.get("product_stage", "")
+    if stage_field_id:
+        raw = _resolve_field(fields, stage_field_id)
+        if raw:
+            labels.extend(_names_from_field(raw))
+
+    # 2. fixVersions — standard Jira field for target release / stage
+    for v in fields.get("fixVersions") or []:
+        if isinstance(v, dict):
+            name = v.get("name", "")
+            if name:
+                labels.append(name)
+        elif isinstance(v, str) and v:
+            labels.append(v)
+
+    # 3. versions (affected)
+    for v in fields.get("versions") or []:
+        if isinstance(v, dict):
+            name = v.get("name", "")
+            if name:
+                labels.append(name)
+        elif isinstance(v, str) and v:
+            labels.append(v)
+
+    # Deduplicate preserving order
+    seen: set[str] = set()
+    result: list[str] = []
+    for lbl in labels:
+        if lbl not in seen:
+            seen.add(lbl)
+            result.append(lbl)
+    return result
+
+
+def _names_from_field(raw: Any) -> list[str]:
+    """Extract a list of name strings from a Jira field value."""
+    if isinstance(raw, str):
+        return [raw] if raw else []
+    if isinstance(raw, dict):
+        name = raw.get("name") or raw.get("value") or raw.get("displayName") or ""
+        return [str(name)] if name else []
+    if isinstance(raw, list):
+        out: list[str] = []
+        for item in raw:
+            out.extend(_names_from_field(item))
+        return out
+    return []
+
 
 def extract_product_fields(
     ticket_fields: dict,
@@ -116,18 +181,36 @@ def extract_product_fields(
     }
 
 
+_COMMENT_CHATTER_RE = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        r"^(moved|transitioned|changed status|updated|assigned|resolved|closed|reopened)\b",
+        r"^(done|ok|ack|acknowledged|noted|thanks|cheers|\+1|-1|approved|lgtm)\W*$",
+        r"^\s*(see attached|see comments|see above|as per|per above|as discussed)\b",
+        r"^(sent|forwarded|cc:|fyi\b)",
+    ]
+]
+
+
 def extract_comments_enriched(comment_container: dict) -> dict:
     """
     Extract all comments with raw + cleaned representations.
 
+    Cleaning steps:
+      - Strip Jira wiki markup (reuses description cleaner)
+      - Normalize whitespace
+      - Detect and exclude trivial operational chatter
+
     Returns:
         CommentsEnriched-compatible dict with:
             - comments_raw:       list of CommentRecord dicts (all non-bot)
-            - comments_cleaned:   list of substantive comment strings
+            - comments_cleaned:   list of substantive comment strings (>= 50 words)
             - comment_count:      total non-bot comment count
             - substantive_count:  comments with >= 50 words
             - important_spans:    key sentences from substantive comments
     """
+    from .description import clean_jira_markup
+
     comments_list = (comment_container or {}).get("comments", [])
     bot_patterns = ["atlassian-bot", "jira-bot", "automation", "webhook"]
 
@@ -145,9 +228,18 @@ def extract_comments_enriched(comment_container: dict) -> dict:
         if isinstance(body, dict):
             body = _extract_adf_text(body)
         body_raw = body.strip()
-        body_cleaned = body_raw  # same here — no further cleaning at this stage
+
+        # Clean: strip Jira markup, collapse whitespace
+        body_cleaned = clean_jira_markup(body_raw) if body_raw else ""
+
+        # Exclude trivial operational chatter before counting
+        word_count_cleaned = len(body_cleaned.split())
+        is_chatter = word_count_cleaned < 10 or any(
+            p.search(body_cleaned) for p in _COMMENT_CHATTER_RE
+        )
+
         word_count = len(body_raw.split())
-        is_substantive = word_count >= 50
+        is_substantive = word_count >= 50 and not is_chatter
 
         record: dict = {
             "comment_id": comment.get("id", ""),
@@ -162,13 +254,13 @@ def extract_comments_enriched(comment_container: dict) -> dict:
 
         if is_substantive:
             comments_cleaned.append(body_cleaned[:2000])
-            # Extract first 2 sentences as important spans
+            # Key sentences: split on period, keep those >= 8 words
             sentences = [s.strip() for s in body_cleaned.split(".") if len(s.strip().split()) >= 8]
             important_spans.extend(sentences[:2])
 
     return {
         "comments_raw": comments_raw,
-        "comments_cleaned": comments_cleaned[:5],   # top 5 substantive comments
+        "comments_cleaned": comments_cleaned[:5],
         "comment_count": len(comments_raw),
         "substantive_count": sum(1 for c in comments_raw if c["is_substantive"]),
         "important_spans": important_spans[:10],

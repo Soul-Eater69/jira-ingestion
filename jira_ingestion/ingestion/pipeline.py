@@ -119,28 +119,28 @@ async def ingest_ticket(
         from .storage import DocumentStore
         store = DocumentStore(output_dir=storage_dir)
 
-        if cfg.enable_raw_artifact_persistence:
-            store.save_pipeline_artifact(ticket_key, 1, "raw_ticket", ticket_data)
-
-        if cfg.enable_attachment_inventory:
-            store.save_pipeline_artifact(
-                ticket_key, 2, "attachment_contents",
-                document["raw"].get("attachment_inventory", [])
-            )
-
+        # ── Numbered debug artifacts (always emitted when storage_dir is set) ──
+        # 01: raw Jira ticket
+        store.save_pipeline_artifact(ticket_key, 1, "raw_ticket", ticket_data)
+        # 02: attachment inventory
+        store.save_pipeline_artifact(
+            ticket_key, 2, "attachment_contents",
+            document["raw"].get("attachment_inventory", [])
+        )
+        # 03: triage output
         store.save_pipeline_artifact(ticket_key, 3, "triage_output", document["observed"]["triage"])
-
-        if cfg.enable_prechunk_persistence:
-            store.save_pipeline_artifact(
-                ticket_key, 4, "assembled_prechunk",
-                _build_prechunk_artifact(document)
-            )
-
+        # 04: pre-chunk assembled document
+        store.save_pipeline_artifact(
+            ticket_key, 4, "assembled_prechunk",
+            _build_prechunk_artifact(document)
+        )
+        # 05: debug report (compact summary of all pipeline decisions)
         store.save_pipeline_artifact(
             ticket_key, 5, "debug_report",
             _build_debug_report(document)
         )
 
+        # ── Optional additional artifacts ──
         if cfg.enable_attachment_text_persistence and _attachments:
             extracted = await jira_client.fetch_attachment_content(_attachments)
             store.save_extracted_attachments(ticket_key, extracted)
@@ -148,6 +148,7 @@ async def ingest_ticket(
         if cfg.enable_debug_stage_persistence:
             store.save_debug_stage(ticket_key, "prefetched_ids", list(_prefetched.keys()))
 
+        # ── Main assembled document ──
         store.save(document, fmt=storage_fmt)
 
     from .indexing import index_retrieval_view, index_supervision_view
@@ -189,12 +190,12 @@ def assemble_document(
         derived    — LLM outputs
     """
     from jira_ingestion.config import JiraIngestionConfig
-    from .metadata import extract_metadata, classify_links, extract_product_fields, extract_comments_enriched
+    from .metadata import extract_metadata, classify_links, extract_product_fields, extract_comments_enriched, extract_stage_labels
     from .triage import triage_attachments, build_triage_artifact, layer0_filter, layer1_score
     from .description import classify_description, build_description_chunks, clean_jira_markup
     from .quality import determine_quality_tier, TIER_WEIGHTS
     from .chunking import build_section_chunks, build_supplementary_chunk
-    from .summary import generate_summary
+    from .summary import generate_summary, generate_derived_artifacts
     from .entities import extract_entities, load_entity_dictionaries, ensure_default_dictionaries
     from .embedding import embed_batch
 
@@ -217,6 +218,7 @@ def assemble_document(
     # 2. Product / supervision labels (not metadata — supervision layer)
     # ------------------------------------------------------------------
     product_fields = extract_product_fields(fields, jira_field_map)
+    product_stage_labels = extract_stage_labels(fields, jira_field_map)
 
     # ------------------------------------------------------------------
     # 3. Comments — enriched (raw + cleaned)
@@ -437,6 +439,49 @@ def assemble_document(
     }
 
     # ------------------------------------------------------------------
+    # 19b. Derived layer — LLM structured outputs + entity signal fallback
+    # ------------------------------------------------------------------
+    derived = generate_derived_artifacts(
+        quality_tier=quality_tier,
+        chunks=all_for_summary,
+        metadata=meta,
+        llm_client=llm_client,
+        model=cfg.llm_model,
+    )
+
+    # Always populate ticket_summary_llm from the heuristic summary if LLM
+    # didn't produce one (ensures the field is never empty when there is content).
+    if not derived["ticket_summary_llm"] and summary_text:
+        derived["ticket_summary_llm"] = summary_text
+
+    # Augment keyword/product/entity fields from entity_mentions when the LLM
+    # did not populate them.  This gives useful signal even in no-LLM mode.
+    if not derived["capability_keywords_llm"]:
+        derived["capability_keywords_llm"] = [
+            m["term"] for m in entity_mentions.get("capabilities", [])
+        ][:8]
+    if not derived["product_mentions_llm"]:
+        derived["product_mentions_llm"] = [
+            m["term"] for m in entity_mentions.get("products", [])
+        ][:8]
+    if not derived["business_entities_llm"]:
+        # Merge components + business_unit + product_area as proxy org entities
+        ent: list[str] = []
+        bu = meta.get("business_unit", "")
+        pa = meta.get("product_area", "")
+        if bu:
+            ent.append(bu)
+        if pa:
+            ent.append(pa)
+        ent.extend(meta.get("components", []))
+        derived["business_entities_llm"] = ent[:8]
+
+    # Use ticket_summary_llm as the primary summary when LLM produced it but
+    # heuristic summary was empty.
+    if derived["ticket_summary_llm"] and not summary_text:
+        summary_text = derived["ticket_summary_llm"]
+
+    # ------------------------------------------------------------------
     # 20. Value stream supervision labels — structured
     # ------------------------------------------------------------------
     vs_links = classified_links.get("vs", [])
@@ -497,7 +542,7 @@ def assemble_document(
             # Product labels
             "impacted_products": product_fields["impacted_products"],
             "impacted_it_products": product_fields["impacted_it_products"],
-            "product_stage_labels": [],
+            "product_stage_labels": product_stage_labels,
             # Trainability
             "trainability": {
                 "has_gold_vs_labels": has_gold_vs,
@@ -510,15 +555,7 @@ def assemble_document(
         },
 
         # ── DERIVED LAYER (LLM) ────────────────────────────────────────
-        "derived": {
-            "ticket_summary_llm": summary_text if llm_client else "",
-            "problem_summary_llm": "",
-            "solution_summary_llm": "",
-            "capability_keywords_llm": [],
-            "workflow_terms_llm": [],
-            "business_entities_llm": [],
-            "product_mentions_llm": [],
-        },
+        "derived": derived,
     }
 
 

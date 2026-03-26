@@ -66,6 +66,9 @@ class JiraIngestionConfig:
         "impacted_it_products": "customfield_10041",
         "requesting_org": "customfield_10050",
         "delivery_org": "customfield_10051",
+        # Product stage / release field (e.g. fixVersions or a custom stage field)
+        # Set to empty string "" to disable and fall back to fixVersions only
+        "product_stage": "customfield_10060",
     })
 
     # --- Lineage / artifact persistence ---
