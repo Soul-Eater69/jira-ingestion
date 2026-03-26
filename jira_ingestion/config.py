@@ -61,12 +61,22 @@ class JiraIngestionConfig:
         "sprint": "customfield_10020",
         "team": "customfield_10001",
         "epic_name": "customfield_10010",
+        # Product / supervision label fields — override per tenant
+        "impacted_products": "customfield_10040",
+        "impacted_it_products": "customfield_10041",
+        "requesting_org": "customfield_10050",
+        "delivery_org": "customfield_10051",
     })
 
     # --- Lineage / artifact persistence ---
     enable_raw_artifact_persistence: bool = True
     enable_attachment_text_persistence: bool = True
     enable_debug_stage_persistence: bool = False  # verbose — off by default
+    enable_prechunk_persistence: bool = True       # pre-chunk assembled doc
+    enable_attachment_inventory: bool = True        # per-attachment inventory JSON
+
+    # --- Retrieval views ---
+    enable_retrieval_views: bool = True  # build multi-focused retrieval views
 
     # --- HTTP / retry ---
     http_timeout_seconds: int = 120
