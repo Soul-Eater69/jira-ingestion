@@ -1,18 +1,40 @@
 """
-Four-layer attachment triage funnel + multi-score triage artifact.
+Multi-document attachment triage for Jira idea-card ingestion.
 
-Layer 0: Extension + size filter  (free — API metadata only)
-Layer 1: Filename heuristic scoring  (free — string parsing)
-Layer 2: Cheap metadata peek  (cheap — 100-200ms, no full parsing)
-Layer 3: Full extraction + confirmation  (moderate — only the winner)
+Why this version exists
+-----------------------
+The old triage implementation selected a single primary attachment and the
+pipeline typically chunked only that file. That is too lossy for tickets where
+supporting PDFs / DOCX / XLSX files contain value-stream, product, or business
+context that does not appear in the main deck.
 
-build_triage_artifact() assembles the first-class triage output with:
-  - primary / supplementary decision
-  - quality tier
-  - selection reason
-  - multi-dimensional scores (extraction_quality, semantic_density,
-    idea_card_likeness, retrieval_readiness)
-  - per-attachment score breakdown
+This version keeps triage as a *routing and weighting* layer rather than a hard
+single-document gate. It still chooses a primary attachment, but it also:
+
+- identifies multiple viable supporting documents
+- returns an explicit processing plan for extraction/chunking
+- preserves excluded/noise docs separately
+- exposes per-attachment multi-dimensional scores
+- makes downstream chunking use `chunk_candidates`, not only the primary doc
+
+Expected caller pattern
+-----------------------
+    primary, supporting, att_quality, triage_artifact = triage_attachments(
+        attachments=ticket_attachments,
+        ticket_summary=ticket_title,
+        download_fn=download_attachment_bytes,
+    )
+
+    chunk_candidates = get_chunking_candidates(triage_artifact)
+    # chunk all docs in chunk_candidates, not just `primary`
+
+Notes
+-----
+- This file assumes the existing extraction modules live beside it, e.g.
+  `.extraction.pptx`, `.extraction.pdf`, `.extraction.docx`
+- XLS/XLSX/CSV can be scored as supporting docs, but full extraction is only
+  implemented here for PPT/PDF/DOCX because those are the current strong
+  extractors shown in your repo screenshots.
 """
 
 from __future__ import annotations
@@ -23,427 +45,587 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Layer 0 constants
-# ---------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
 
 KILL_EXTENSIONS = {
-    "png", "jpg", "jpeg", "gif", "svg", "bmp", "ico", "tiff", "webp",
-    "mp4", "mov", "avi", "wmv", "mp3", "wav", "m4a", "flac",
-    "zip", "rar", "7z", "tar", "gz",
-    "exe", "dmg", "msi", "sh", "bat",
+    "png",
+    "jpg",
+    "jpeg",
+    "gif",
+    "svg",
+    "bmp",
+    "ico",
+    "tiff",
+    "webp",
+    "mp3",
+    "wav",
+    "m4a",
+    "flac",
+    "zip",
+    "rar",
+    "7z",
+    "tar",
+    "gz",
+    "exe",
+    "dmg",
+    "msi",
+    "sh",
+    "bat",
 }
 
-EXTRACTABLE_EXTENSIONS = {"pptx", "ppt", "pdf", "docx", "doc", "xlsx", "csv", "xls"}
+EXTRACTABLE_EXTENSIONS = {"pptx", "ppt", "pdf", "docx", "doc", "xlsx", "xls", "csv"}
 
-# ---------------------------------------------------------------------------
-# Layer 1 scoring signals
-# ---------------------------------------------------------------------------
-
-_L1_POSITIVE: list[tuple[str | re.Pattern, int]] = [
-    (re.compile(r"\bidea[\s_-]?card\b", re.IGNORECASE), 50),
-    (re.compile(r"\bidea\b", re.IGNORECASE), 40),
-    (re.compile(r"\bproposal\b|\binitiative\b", re.IGNORECASE), 40),
-    (re.compile(r"\bpitch\b|\bconcept\b", re.IGNORECASE), 35),
-    (re.compile(r"\bbusiness[\s_-]?case\b", re.IGNORECASE), 30),
-    (re.compile(r"\bv\d+\b|final|latest", re.IGNORECASE), 15),
+L1_POSITIVE: list[tuple[re.Pattern, int]] = [
+    (re.compile(r"\b(idea|initiative|proposal|pitch|concept)\b", re.IGNORECASE), 45),
+    (re.compile(r"\b(card|deck|slides?)\b", re.IGNORECASE), 25),
+    (re.compile(r"\b(business[\s_-]?case|value[\s_-]?stream)\b", re.IGNORECASE), 20),
+    (re.compile(r"\b(final|latest|v\d+)\b", re.IGNORECASE), 10),
+    (re.compile(r"\b(roadmap|strategy|opportunity|proposal)\b", re.IGNORECASE), 12),
 ]
 
-_L1_NEGATIVE: list[tuple[str | re.Pattern, int]] = [
-    (re.compile(r"\blogo\b|\bbrand\b|\bicon\b", re.IGNORECASE), -50),
-    (re.compile(r"\btemplate\b|\bblank\b", re.IGNORECASE), -40),
-    (re.compile(r"\bscreenshot\b|\bcapture\b|\bscreen\b", re.IGNORECASE), -30),
-    (re.compile(r"\bold\b|\barchive\b|\bbackup\b", re.IGNORECASE), -25),
-    (re.compile(r"^\d+$"), -20),                           # purely numeric stem
-    (re.compile(r"\bbudget\b|\bfinance\b|\bcost\b", re.IGNORECASE), -20),
-    (re.compile(r"\bappendix\b|\bsupplement\b", re.IGNORECASE), -15),
+L1_NEGATIVE: list[tuple[re.Pattern, int]] = [
+    (re.compile(r"\b(template|sample|placeholder|draft\s*template)\b", re.IGNORECASE), -40),
+    (re.compile(r"\b(logo|icon|banner|screenshot|screen\s*shot)\b", re.IGNORECASE), -35),
+    (re.compile(r"\b(backup|old|archive|duplicate|copy)\b", re.IGNORECASE), -20),
+    (re.compile(r"\b(budget|finance|costing|invoice)\b", re.IGNORECASE), -10),
 ]
 
-_EXT_BONUS: dict[str, int] = {
-    "pptx": 20, "ppt": 20,
-    "pdf": 5,
-    "docx": 10, "doc": 10,
-    "xlsx": -15, "xls": -15, "csv": -15,
+EXT_BONUS = {
+    "pptx": 25,
+    "ppt": 18,
+    "pdf": 15,
+    "docx": 12,
+    "doc": 8,
+    "xlsx": 5,
+    "xls": 3,
+    "csv": 0,
 }
 
-_TEMPLATE_PHRASES = [
-    "insert here", "[placeholder]", "lorem ipsum",
-    "click to add", "type here", "[your text]",
-    "add title", "add text",
+TEMPLATE_PHRASES = [
+    "insert here",
+    "[placeholder]",
+    "lorem ipsum",
+    "click to add",
+    "type here",
+    "your text",
+    "add title",
+    "add text",
 ]
 
+BUSINESS_SIGNAL_TERMS = {
+    "customer",
+    "member",
+    "provider",
+    "workflow",
+    "process",
+    "journey",
+    "value",
+    "stream",
+    "benefit",
+    "impact",
+    "problem",
+    "opportunity",
+    "solution",
+    "initiative",
+    "business",
+    "product",
+    "feature",
+    "integration",
+    "platform",
+    "experience",
+    "automation",
+    "claims",
+    "authorization",
+    "clinical",
+    "operations",
+    "analytics",
+    "data",
+    "member",
+}
 
-# ---------------------------------------------------------------------------
+MIN_TEXT_WORDS_SUPPORT = 40
+MIN_TEXT_WORDS_IDEA = 80
+MAX_FULL_EXTRACT_DOCS = 5
+MAX_SUPPORTING_DOCS = 4
+MAX_PEEK_DOCS = 5
+
+
+# -----------------------------------------------------------------------------
 # Public API
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
 
 def triage_attachments(
     attachments: list[dict],
     ticket_summary: str = "",
     download_fn: Optional[Callable[[dict], bytes]] = None,
-) -> tuple[Optional[dict], list[dict], str]:
+) -> tuple[Optional[dict], list[dict], str, dict]:
     """
-    Run the four-layer triage funnel.
-
-    Args:
-        attachments:   Raw attachment dicts from get_ticket_data()
-        ticket_summary: Ticket title (used for filename matching in Layer 1)
-        download_fn:   Callable(attachment_dict) -> bytes for Layers 2 & 3.
-                       If None, triage stops after Layer 1.
+    Multi-document triage.
 
     Returns:
-        (primary, supplementary, att_quality)
-        - primary:        Winning attachment dict (enriched with triage metadata) or None
-        - supplementary:  Up to 2 runner-up attachments
-        - att_quality:    'good' | 'fallback' | 'none'
+        (primary, supporting, att_quality, triage_artifact)
+
+    `supporting` are the viable chunk-worthy non-primary docs.
+    `triage_artifact` includes the full processing plan and all scored attachments.
     """
     if not attachments:
-        return None, [], "none"
+        artifact = build_triage_artifact(
+            primary=None,
+            supporting=[],
+            excluded=[],
+            all_scored=[],
+            att_quality="none",
+            total_attachment_count=0,
+        )
+        return None, [], "none", artifact
 
-    # Layer 0
-    survivors = layer0_filter(attachments)
+    # Layer 0: coarse filter
+    survivors, excluded = _layer0_filter(attachments)
     if not survivors:
-        return None, [], "none"
+        artifact = build_triage_artifact(
+            primary=None,
+            supporting=[],
+            excluded=excluded,
+            all_scored=[],
+            att_quality="none",
+            total_attachment_count=len(attachments),
+        )
+        return None, [], "none", artifact
 
-    # Layer 1
-    scored = layer1_score(survivors, ticket_summary=ticket_summary)
-    if not scored:
-        return None, [], "none"
+    # Layer 1: lightweight filename/meta scoring
+    scored = _layer1_score(survivors, ticket_summary=ticket_summary)
+    scored.sort(key=_sort_key, reverse=True)
 
-    scored.sort(key=lambda x: x["triage_score"], reverse=True)
-    top_score = scored[0]["triage_score"]
-    gap = top_score - (scored[1]["triage_score"] if len(scored) > 1 else 0)
+    # Layer 2: cheap peek on the most promising candidates
+    if download_fn:
+        peek_candidates = scored[:MAX_PEEK_DOCS]
+        _layer2_peek(peek_candidates, download_fn)
+        scored.sort(key=_sort_key, reverse=True)
 
-    # Determine how many need a Layer 2 peek
-    if top_score >= 60 and gap >= 20:
-        peek_candidates = [scored[0]]
-        skip_peek = True
-    elif top_score >= 30:
-        peek_candidates = scored[:2]
-        skip_peek = False
-    else:
-        peek_candidates = scored[:3]
-        skip_peek = False
+        # Layer 3: full extraction on more than one doc, not first-win-stop
+        full_extract_candidates = _select_full_extract_candidates(scored)
+        _layer3_extract_many(full_extract_candidates, download_fn)
+        scored.sort(key=_sort_key, reverse=True)
 
-    if download_fn is None:
-        # Can't do Layers 2/3 — return Layer 1 winner
-        winner = scored[0]
-        supp = [s for s in scored[1:3] if s["triage_score"] >= 15]
-        return winner, supp, "fallback"
+    primary = _select_primary(scored)
+    supporting = _select_supporting(scored, primary)
+    excluded.extend(_select_additional_excluded(scored, primary, supporting))
+    att_quality = _derive_att_quality(primary, supporting)
 
-    # Layer 2
-    if not skip_peek:
-        peek_candidates = layer2_peek(peek_candidates, download_fn)
-        peek_candidates.sort(key=lambda x: x["triage_score"], reverse=True)
-
-    # Layer 3 — full extraction + confirmation
-    for candidate in peek_candidates:
-        try:
-            file_bytes = download_fn(candidate)
-            extracted = _full_extract_text(file_bytes, candidate["ext"])
-            if confirm_is_idea_card(extracted):
-                candidate["file_bytes"] = file_bytes
-                candidate["confirmed"] = True
-                supp = [
-                    s for s in scored
-                    if s is not candidate and s["triage_score"] >= 15
-                ][:2]
-                return candidate, supp, "good"
-        except Exception as exc:
-            logger.warning("Layer 3 failed for %s: %s", candidate.get("filename"), exc)
-            continue
-
-    # All candidates failed confirmation — fall back to highest scorer
-    winner = scored[0]
-    try:
-        if "file_bytes" not in winner:
-            winner["file_bytes"] = download_fn(winner)
-        winner["confirmed"] = False
-    except Exception:
-        pass
-
-    supp = [s for s in scored[1:3] if s["triage_score"] >= 15]
-    return winner, supp, "fallback"
+    artifact = build_triage_artifact(
+        primary=primary,
+        supporting=supporting,
+        excluded=excluded,
+        all_scored=scored,
+        att_quality=att_quality,
+        total_attachment_count=len(attachments),
+    )
+    return primary, supporting, att_quality, artifact
 
 
-def layer0_filter(attachments: list[dict]) -> list[dict]:
-    """Remove obviously unsuitable attachments based on extension and size."""
+def get_chunking_candidates(triage_artifact: dict) -> list[dict]:
+    """Return the attachment dicts that should be chunked downstream."""
+    return list(triage_artifact.get("chunk_candidates", []))
+
+
+# -----------------------------------------------------------------------------
+# Layer 0: filter
+# -----------------------------------------------------------------------------
+
+
+def _layer0_filter(attachments: list[dict]) -> tuple[list[dict], list[dict]]:
     survivors: list[dict] = []
-    for att in attachments:
-        filename = att.get("filename", "")
-        ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
-        size = att.get("size", 0)
+    excluded: list[dict] = []
 
+    for raw in attachments:
+        att = dict(raw)
+        ext = _ext_of(att)
+        size = int(att.get("size", 0) or 0)
+        att["ext"] = ext
+        att["triage_stage"] = "layer0"
+
+        reason: Optional[str] = None
         if ext in KILL_EXTENSIONS:
-            continue
-        if ext not in EXTRACTABLE_EXTENSIONS:
-            continue
-        if size < 15_000:
-            continue
-        if ext == "pdf" and size < 50_000:
-            continue
-        if size > 100_000_000:
+            reason = f"excluded extension: {ext}"
+        elif ext not in EXTRACTABLE_EXTENSIONS:
+            reason = f"non-extractable extension: {ext or 'unknown'}"
+        elif size and size < 15_000:
+            reason = "file too small"
+        elif ext == "pdf" and size > 80_000_000:
+            reason = "pdf too large"
+        elif size > 100_000_000:
+            reason = "file too large"
+
+        if reason:
+            att["excluded_reason"] = reason
+            att["doc_role"] = "excluded_noise"
+            excluded.append(att)
             continue
 
-        survivors.append({**att, "ext": ext})
+        survivors.append(att)
 
-    return survivors
+    return survivors, excluded
 
 
-def layer1_score(
-    survivors: list[dict],
-    ticket_summary: str = "",
-) -> list[dict]:
-    """Score each surviving attachment based on filename heuristics."""
-    # Summary words for filename matching
-    summary_words = set(re.sub(r"[^a-z0-9\s]", "", ticket_summary.lower()).split())
-    summary_words -= {"the", "a", "an", "in", "of", "for", "and", "or", "to", "is"}
+# -----------------------------------------------------------------------------
+# Layer 1: score using metadata / filename
+# -----------------------------------------------------------------------------
 
-    # Stem set for duplicate detection
+
+def _layer1_score(survivors: list[dict], ticket_summary: str = "") -> list[dict]:
+    summary_words = {w for w in _simple_words(ticket_summary) if len(w) >= 3}
     stems: dict[str, list[str]] = {}
+
     for att in survivors:
-        stem = att["filename"].lower().rsplit(".", 1)[0]
-        stems.setdefault(stem, []).append(att["filename"])
+        stems.setdefault(_stem(att), []).append(att.get("filename", ""))
 
     sorted_by_date = sorted(survivors, key=lambda a: a.get("created", ""), reverse=True)
 
     scored: list[dict] = []
     for rank, att in enumerate(sorted_by_date):
         filename = att.get("filename", "")
-        ext = att.get("ext", "")
-        stem = filename.lower().rsplit(".", 1)[0]
-        name_lower = stem.lower()
+        ext = att.get("ext", _ext_of(att))
+        name_lower = filename.lower()
+
         score = 0
         reasons: list[str] = []
 
-        for pattern, pts in _L1_POSITIVE:
-            if isinstance(pattern, re.Pattern) and pattern.search(name_lower):
+        for pattern, pts in L1_POSITIVE:
+            if pattern.search(name_lower):
                 score += pts
-                reasons.append(f"+{pts} ({pattern.pattern[:30]})")
+                reasons.append(f"+{pts} filename:{pattern.pattern[:28]}")
 
-        for pattern, pts in _L1_NEGATIVE:
-            if isinstance(pattern, re.Pattern) and pattern.search(name_lower):
-                score += pts  # pts is negative
-                reasons.append(f"{pts} ({pattern.pattern[:30]})")
+        for pattern, pts in L1_NEGATIVE:
+            if pattern.search(name_lower):
+                score += pts
+                reasons.append(f"{pts} filename:{pattern.pattern[:28]}")
 
-        score += _EXT_BONUS.get(ext, 0)
-        if _EXT_BONUS.get(ext, 0) != 0:
-            reasons.append(f"+{_EXT_BONUS.get(ext, 0)} (ext)")
+        ext_pts = EXT_BONUS.get(ext, 0)
+        if ext_pts:
+            score += ext_pts
+            reasons.append(f"+{ext_pts} ext:{ext}")
 
-        # Summary word overlap
-        filename_words = set(re.sub(r"[^a-z0-9\s]", "", name_lower).split())
-        overlap = filename_words & summary_words
+        overlap = summary_words.intersection(_simple_words(name_lower))
         if len(overlap) >= 2:
-            score += 25
-            reasons.append(f"+25 (summary words: {', '.join(list(overlap)[:3])})")
+            pts = min(20, 5 * len(overlap))
+            score += pts
+            reasons.append(f"+{pts} summary-overlap:{', '.join(sorted(list(overlap))[:4])}")
 
-        # Uploaded by reporter
         if att.get("is_reporter_upload"):
-            score += 10
-            reasons.append("+10 (reporter upload)")
+            score += 8
+            reasons.append("+8 reporter-upload")
 
-        # Most recent
         if rank == 0:
             score += 5
-            reasons.append("+5 (most recent)")
+            reasons.append("+5 most-recent")
 
-        # Duplicate stem penalty
-        if len(stems.get(stem, [])) > 1:
+        if len(stems.get(_stem(att), [])) > 1:
             score -= 10
-            reasons.append("-10 (duplicate stem)")
+            reasons.append("-10 duplicate-stem")
 
-        # Descriptive filename (2-6 words)
-        word_count = len(re.findall(r"[a-z]+", name_lower))
-        if 2 <= word_count <= 6:
-            score += 10
-            reasons.append("+10 (descriptive name)")
+        wc = len(_simple_words(name_lower))
+        if 2 <= wc <= 6:
+            score += 8
+            reasons.append("+8 descriptive-filename")
 
-        scored.append({**att, "triage_score": score, "triage_reasons": reasons})
+        att["triage_score"] = score
+        att["triage_reasons"] = reasons
+        att["triage_stage"] = "layer1"
+        scored.append(att)
 
     return scored
 
 
-def layer2_peek(candidates: list[dict], download_fn: Callable[[dict], bytes]) -> list[dict]:
-    """Download candidates and inspect metadata without full extraction."""
-    from .extraction.pptx import cheap_peek_pptx
-    from .extraction.pdf import cheap_peek_pdf
-    from .extraction.docx import cheap_peek_docx
+# -----------------------------------------------------------------------------
+# Layer 2: cheap peek
+# -----------------------------------------------------------------------------
 
-    updated: list[dict] = []
+
+def _layer2_peek(candidates: list[dict], download_fn: Callable[[dict], bytes]) -> None:
     for att in candidates:
         ext = att.get("ext", "")
         try:
             file_bytes = download_fn(att)
-            att = {**att, "_peek_bytes": file_bytes}  # cache for Layer 3
+            att["peek_bytes"] = file_bytes
+            peek = _cheap_peek(file_bytes, ext)
+            att["peek_metadata"] = peek
 
-            if ext in ("pptx", "ppt"):
-                peek = cheap_peek_pptx(file_bytes)
-            elif ext == "pdf":
-                peek = cheap_peek_pdf(file_bytes)
-            elif ext in ("docx", "doc"):
-                peek = cheap_peek_docx(file_bytes)
-            else:
-                peek = {}
-
-            # Adjust score based on peek results
             score_adj = 0
             if peek.get("is_likely_idea_card"):
                 score_adj += 20
             if peek.get("is_likely_template"):
                 score_adj -= 30
-            if peek.get("slide_count") and peek["slide_count"] > 60:
-                score_adj -= 10
+            if (peek.get("slide_count") or 0) >= 5:
+                score_adj += 8
+            if (peek.get("word_count") or 0) >= 80:
+                score_adj += 8
 
-            att["triage_score"] = att["triage_score"] + score_adj
-            att["peek_metadata"] = peek
+            att["triage_score"] = att.get("triage_score", 0) + score_adj
+            if score_adj:
+                att.setdefault("triage_reasons", []).append(f"{score_adj:+d} cheap-peek")
+            att["triage_stage"] = "layer2"
         except Exception as exc:
-            logger.debug("Peek failed for %s: %s", att.get("filename"), exc)
-
-        updated.append(att)
-    return updated
+            logger.warning("Cheap peek failed for %s: %s", att.get("filename"), exc)
 
 
-def confirm_is_idea_card(extracted: Optional[dict]) -> bool:
-    """Validate that a fully extracted document is indeed an idea card."""
-    if not extracted or not extracted.get("text"):
-        return False
-    text = extracted["text"]
-    if len(text.split()) < 100:
-        return False
-    text_lower = text.lower()
-    template_hits = sum(1 for p in _TEMPLATE_PHRASES if p in text_lower)
-    if template_hits >= 2:
-        return False
-    non_bp_count = extracted.get("non_boilerplate_count", 0)
-    if non_bp_count < 2:
-        return False
-    return True
+# -----------------------------------------------------------------------------
+# Layer 3: full extraction on multiple docs
+# -----------------------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
-# Layer 3 helper: lightweight full-text extraction for confirmation
-# ---------------------------------------------------------------------------
+def _select_full_extract_candidates(scored: list[dict]) -> list[dict]:
+    """
+    Extract more than one doc.
 
-# ---------------------------------------------------------------------------
-# Multi-score triage artifact (first-class stage output)
-# ---------------------------------------------------------------------------
+    Strategy:
+    - always include the current top-ranked doc
+    - include other docs with decent score / likely usefulness
+    - cap total docs to keep ingestion bounded
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    for idx, att in enumerate(scored):
+        att_id = _attachment_id(att)
+        if att_id in seen:
+            continue
+
+        triage_score = att.get("triage_score", 0)
+        ext = att.get("ext", "")
+        peek = att.get("peek_metadata", {}) or {}
+
+        include = False
+        if idx == 0:
+            include = True
+        elif triage_score >= 40:
+            include = True
+        elif peek.get("is_likely_idea_card"):
+            include = True
+        elif ext in {"pdf", "docx", "doc"} and triage_score >= 25:
+            include = True
+
+        if not include:
+            continue
+
+        seen.add(att_id)
+        out.append(att)
+        if len(out) >= MAX_FULL_EXTRACT_DOCS:
+            break
+
+    return out
+
+
+
+def _layer3_extract_many(candidates: list[dict], download_fn: Callable[[dict], bytes]) -> None:
+    for att in candidates:
+        ext = att.get("ext", "")
+        try:
+            file_bytes = att.get("peek_bytes") or download_fn(att)
+            att["file_bytes"] = file_bytes
+            extracted = _full_extract_text(file_bytes, ext)
+            att["extracted"] = extracted
+
+            extracted_text = extracted.get("text", "") if extracted else ""
+            word_count = len(_simple_words(extracted_text))
+            business_signal_count = _business_signal_count(extracted_text)
+            confirmed = _confirm_is_idea_card(extracted)
+            semantic_density = _semantic_density(extracted_text)
+            likely_template = extracted.get("template_phrase_hits", 0) >= 2
+
+            att["confirmed"] = confirmed
+            att["word_count"] = word_count
+            att["business_signal_count"] = business_signal_count
+            att["semantic_density"] = semantic_density
+            att["likely_template"] = likely_template
+
+            score_adj = 0
+            if confirmed:
+                score_adj += 25
+            if business_signal_count >= 4:
+                score_adj += 10
+            if semantic_density >= 0.18:
+                score_adj += 8
+            if likely_template:
+                score_adj -= 25
+
+            att["triage_score"] = att.get("triage_score", 0) + score_adj
+            if score_adj:
+                att.setdefault("triage_reasons", []).append(f"{score_adj:+d} full-extract")
+            att["att_scores"] = _compute_att_scores(att)
+            att["triage_stage"] = "layer3"
+        except Exception as exc:
+            logger.warning("Full extraction failed for %s: %s", att.get("filename"), exc)
+            att.setdefault("att_scores", _compute_att_scores(att))
+
+    for att in candidates:
+        att.setdefault("att_scores", _compute_att_scores(att))
+
+
+# -----------------------------------------------------------------------------
+# Selection
+# -----------------------------------------------------------------------------
+
+
+def _select_primary(scored: list[dict]) -> Optional[dict]:
+    if not scored:
+        return None
+
+    confirmed = [a for a in scored if a.get("confirmed")]
+    if confirmed:
+        primary = max(confirmed, key=_primary_key)
+        primary["doc_role"] = "primary_idea_card"
+        return primary
+
+    viable = [a for a in scored if _is_supporting_worthy(a)]
+    if viable:
+        primary = max(viable, key=_primary_key)
+        primary["doc_role"] = "primary_fallback"
+        return primary
+
+    primary = max(scored, key=_primary_key)
+    primary["doc_role"] = "primary_fallback"
+    return primary
+
+
+
+def _select_supporting(scored: list[dict], primary: Optional[dict]) -> list[dict]:
+    if not scored:
+        return []
+
+    primary_id = _attachment_id(primary) if primary else None
+    supporting: list[dict] = []
+    seen_stems: set[str] = set()
+
+    for att in scored:
+        att_id = _attachment_id(att)
+        if primary_id and att_id == primary_id:
+            continue
+        if not _is_supporting_worthy(att):
+            continue
+
+        stem = _stem(att)
+        if stem in seen_stems:
+            # Skip obvious duplicates among support docs.
+            continue
+
+        att["doc_role"] = "supporting_doc"
+        supporting.append(att)
+        seen_stems.add(stem)
+        if len(supporting) >= MAX_SUPPORTING_DOCS:
+            break
+
+    return supporting
+
+
+
+def _select_additional_excluded(scored: list[dict], primary: Optional[dict], supporting: list[dict]) -> list[dict]:
+    keep_ids = {_attachment_id(a) for a in ([primary] if primary else []) + supporting}
+    excluded: list[dict] = []
+    for att in scored:
+        if _attachment_id(att) in keep_ids:
+            continue
+        if att.get("triage_score", 0) <= 0 or att.get("likely_template"):
+            att["doc_role"] = "excluded_noise"
+            if "excluded_reason" not in att:
+                att["excluded_reason"] = "low score or template-like"
+            excluded.append(att)
+    return excluded
+
+
+# -----------------------------------------------------------------------------
+# Artifact / plan
+# -----------------------------------------------------------------------------
+
 
 def build_triage_artifact(
     primary: Optional[dict],
-    supplementary: list[dict],
-    att_quality: str,
+    supporting: list[dict],
+    excluded: list[dict],
     all_scored: list[dict],
+    att_quality: str,
     total_attachment_count: int = 0,
 ) -> dict:
-    """
-    Build a structured triage artifact from the triage funnel result.
-
-    This is the persisted output of the triage stage (03_triage_output.json).
-    All downstream layers consume this artifact instead of raw triage state.
-
-    Args:
-        primary:                 Winning attachment dict (enriched by triage) or None.
-        supplementary:           Runner-up attachment dicts.
-        att_quality:             'good' | 'fallback' | 'none'.
-        all_scored:              All Layer-1 scored candidates.
-        total_attachment_count:  Total attachments on the ticket (pre-filter).
-
-    Returns:
-        TriageArtifact-compatible dict.
-    """
-    viable_count = len(all_scored)
-
-    # Build per-attachment score breakdown
-    per_att: list[dict] = []
-    for att in all_scored:
-        scores = _compute_att_scores(att)
-        per_att.append({
-            "filename": att.get("filename", ""),
-            "attachment_id": str(att.get("id", "")),
-            "ext": att.get("ext", ""),
-            "size": att.get("size", 0),
-            "triage_score": att.get("triage_score", 0),
-            "triage_reasons": att.get("triage_reasons", []),
-            "confirmed": att.get("confirmed", False),
-            "scores": scores,
-        })
-
-    # Aggregate scores for the primary attachment
+    chunk_candidates: list[dict] = []
     if primary:
-        primary_scores = _compute_att_scores(primary)
-    else:
-        primary_scores = {
-            "extraction_quality": 0.0,
-            "semantic_density": 0.0,
-            "idea_card_likeness": 0.0,
-            "retrieval_readiness": 0.0,
-        }
+        chunk_candidates.append(primary)
+    for att in supporting:
+        if _attachment_id(att) not in {_attachment_id(a) for a in chunk_candidates}:
+            chunk_candidates.append(att)
 
-    # Derive quality tier from att_quality + primary scores
-    quality_tier = _derive_quality_tier(att_quality, primary, primary_scores)
+    full_extract = [a for a in chunk_candidates if a.get("extracted")]
+    light_extract = [
+        a
+        for a in all_scored
+        if _attachment_id(a) not in {_attachment_id(x) for x in full_extract}
+        and _attachment_id(a) not in {_attachment_id(x) for x in excluded}
+        and a.get("triage_score", 0) > 10
+    ]
 
-    # Build human-readable selection reason
-    selection_reason = _build_selection_reason(primary, att_quality, primary_scores)
-
-    return {
-        "primary_attachment": primary["filename"] if primary else None,
-        "primary_attachment_id": str(primary.get("id", "")) if primary else None,
-        "supplementary_attachments": [s["filename"] for s in supplementary],
+    artifact = {
+        "primary_attachment": _public_attachment_summary(primary),
+        "supporting_attachments": [_public_attachment_summary(a) for a in supporting],
+        "excluded_attachments": [_public_attachment_summary(a) for a in excluded],
+        "chunk_candidates": chunk_candidates,
         "att_quality": att_quality,
-        "quality_tier": quality_tier,
-        "selection_reason": selection_reason,
-        "scores": primary_scores,
-        "per_attachment_scores": per_att,
+        "quality_tier": _derive_quality_tier(att_quality, primary),
+        "selection_reason": _build_selection_reason(primary, supporting),
+        "processing_plan": {
+            "full_extract": [_attachment_id(a) for a in full_extract],
+            "light_extract": [_attachment_id(a) for a in light_extract],
+            "skip": [_attachment_id(a) for a in excluded],
+            "chunk_candidates": [_attachment_id(a) for a in chunk_candidates],
+        },
+        "per_attachment_scores": [_public_attachment_summary(a) for a in all_scored],
         "attachment_count_total": total_attachment_count,
-        "attachment_count_viable": viable_count,
-        # Backward compat with v2.0 schema
+        "attachment_count_viable": len(chunk_candidates),
+        # backwards-friendly fields
+        "primary_attachment_id": _attachment_id(primary) if primary else None,
         "triage_score": primary.get("triage_score") if primary else None,
-        "triage_reasons": primary.get("triage_reasons", []) if primary else [],
+        "triage_reasons": list(primary.get("triage_reasons", [])) if primary else [],
     }
+    return artifact
+
+
+# -----------------------------------------------------------------------------
+# Helpers: scoring / heuristics
+# -----------------------------------------------------------------------------
 
 
 def _compute_att_scores(att: dict) -> dict:
-    """
-    Compute multi-dimensional scores for one attachment using available signals.
+    ext = att.get("ext", "")
+    triage_score = float(att.get("triage_score", 0) or 0)
+    confirmed = bool(att.get("confirmed", False))
+    peek = att.get("peek_metadata", {}) or {}
+    size = int(att.get("size", 0) or 0)
 
-    These are proxy scores based on triage metadata (no full text analysis).
-    They capture what we know at triage time about each file.
+    extraction_quality = {
+        "pptx": 0.90,
+        "ppt": 0.85,
+        "pdf": 0.78,
+        "docx": 0.85,
+        "doc": 0.72,
+        "xlsx": 0.45,
+        "xls": 0.35,
+        "csv": 0.40,
+    }.get(ext, 0.50)
 
-    Scores:
-        extraction_quality   — how cleanly can text be extracted?
-        semantic_density     — how likely is it to contain business signal?
-        idea_card_likeness   — how likely is it the primary idea card?
-        retrieval_readiness  — how useful for value-stream retrieval?
-    """
-    ext = att.get("ext", "").lower()
-    triage_score = att.get("triage_score", 0)
-    confirmed = att.get("confirmed", False)
-    peek = att.get("peek_metadata", {})
-    size = att.get("size", 0)
+    if ext == "pdf" and size >= 500_000:
+        extraction_quality = min(0.86, extraction_quality + 0.06)
+    if att.get("extracted") and att.get("word_count", 0) >= 80:
+        extraction_quality = min(0.95, extraction_quality + 0.05)
 
-    # --- extraction_quality ---
-    # pptx/docx have native XML text = high quality
-    # pdf can be native or scanned (treat as moderate without OCR info)
-    ext_quality = {"pptx": 0.90, "ppt": 0.85, "docx": 0.90, "doc": 0.85, "pdf": 0.70, "xlsx": 0.50, "csv": 0.40}
-    extraction_quality = ext_quality.get(ext, 0.50)
-    if peek.get("is_likely_template"):
-        extraction_quality *= 0.6
-    if ext == "pdf" and size > 500_000:
-        # Large PDFs often have native text
-        extraction_quality = min(0.85, extraction_quality + 0.10)
+    semantic_density = max(0.0, min(1.0, att.get("semantic_density", 0.0)))
+    if semantic_density == 0.0:
+        semantic_density = max(0.0, min(1.0, triage_score / 100.0))
+        if peek.get("is_likely_idea_card"):
+            semantic_density = min(1.0, semantic_density + 0.15)
 
-    # --- semantic_density ---
-    # Normalize triage score to 0-1; min=0, reasonable max=100
-    semantic_density = max(0.0, min(1.0, triage_score / 100.0))
-    if peek.get("is_likely_idea_card"):
-        semantic_density = min(1.0, semantic_density + 0.20)
-    slide_count = peek.get("slide_count") or 0
-    if slide_count and slide_count > 60:
-        semantic_density = max(0.0, semantic_density - 0.10)
-
-    # --- idea_card_likeness ---
     if confirmed:
-        idea_card_likeness = 0.90
+        idea_card_likeness = 0.92
     elif peek.get("is_likely_idea_card"):
         idea_card_likeness = 0.70
     elif triage_score >= 40:
@@ -453,17 +635,11 @@ def _compute_att_scores(att: dict) -> dict:
     else:
         idea_card_likeness = 0.15
 
-    # Boost pptx — most idea cards are decks
-    if ext in ("pptx", "ppt"):
+    if ext in {"pptx", "ppt"}:
         idea_card_likeness = min(1.0, idea_card_likeness + 0.05)
 
-    # --- retrieval_readiness ---
-    # Combination of the above — an attachment is retrieval-ready if it has
-    # good extraction + semantic content + is likely the idea card
     retrieval_readiness = round(
-        0.30 * extraction_quality
-        + 0.30 * semantic_density
-        + 0.40 * idea_card_likeness,
+        0.30 * extraction_quality + 0.30 * semantic_density + 0.40 * idea_card_likeness,
         4,
     )
 
@@ -471,76 +647,251 @@ def _compute_att_scores(att: dict) -> dict:
         "extraction_quality": round(extraction_quality, 4),
         "semantic_density": round(semantic_density, 4),
         "idea_card_likeness": round(idea_card_likeness, 4),
-        "retrieval_readiness": round(retrieval_readiness, 4),
+        "retrieval_readiness": retrieval_readiness,
     }
 
 
-def _derive_quality_tier(att_quality: str, primary: Optional[dict], scores: dict) -> str:
-    """Map triage result to a quality tier label for the triage artifact."""
-    if not primary or att_quality == "none":
+
+def _derive_att_quality(primary: Optional[dict], supporting: list[dict]) -> str:
+    if not primary:
         return "none"
-    if att_quality == "good":
+
+    scores = primary.get("att_scores") or _compute_att_scores(primary)
+    rr = scores.get("retrieval_readiness", 0.0)
+    eq = scores.get("extraction_quality", 0.0)
+
+    if primary.get("confirmed") and rr >= 0.65 and eq >= 0.75:
+        return "good"
+    if rr >= 0.45 or supporting:
+        return "fallback"
+    return "none"
+
+
+
+def _derive_quality_tier(att_quality: str, primary: Optional[dict]) -> str:
+    if att_quality == "none" or not primary:
+        return "C"
+    if primary.get("confirmed") and att_quality == "good":
         return "A"
-    # fallback — differentiate on score
-    if scores.get("retrieval_readiness", 0) >= 0.55:
+    if att_quality == "good":
         return "B"
     return "C"
 
 
-def _build_selection_reason(primary: Optional[dict], att_quality: str, scores: dict) -> str:
-    """Build a human-readable explanation of why the primary was selected."""
-    if not primary:
-        return "No viable attachments found after extension and size filtering."
-    filename = primary.get("filename", "")
-    reasons = primary.get("triage_reasons", [])
-    top_reasons = "; ".join(reasons[:3]) if reasons else "filename heuristic scoring"
-    confirmed = primary.get("confirmed", False)
 
-    if att_quality == "good" and confirmed:
+def _build_selection_reason(primary: Optional[dict], supporting: list[dict]) -> str:
+    if not primary:
+        return "No viable extractable attachments found after filtering."
+
+    filename = primary.get("filename", "attachment")
+    reasons = primary.get("triage_reasons", [])[:3]
+    top_reasons = ", ".join(reasons) if reasons else "filename/meta heuristics"
+    confirmed = primary.get("confirmed", False)
+    support_count = len(supporting)
+
+    if confirmed:
         return (
-            f"'{filename}' selected as primary — confirmed idea card structure. "
-            f"Scoring signals: {top_reasons}."
+            f"{filename} selected as primary because it was confirmed as the best idea-card-like "
+            f"document. Signals: {top_reasons}. Additional supporting docs kept for chunking: {support_count}."
         )
-    if att_quality == "good":
-        return (
-            f"'{filename}' selected as primary — passed all triage layers. "
-            f"Scoring signals: {top_reasons}."
-        )
-    rr = scores.get("retrieval_readiness", 0)
     return (
-        f"'{filename}' selected as fallback primary (quality tier={_derive_quality_tier(att_quality, primary, scores)}, "
-        f"retrieval_readiness={rr:.2f}). "
-        f"Scoring signals: {top_reasons}."
+        f"{filename} selected as primary fallback based on ranking and extraction readiness. "
+        f"Signals: {top_reasons}. Additional supporting docs kept for chunking: {support_count}."
     )
 
 
-# ---------------------------------------------------------------------------
-# Layer 3 helper: lightweight full-text extraction for confirmation
-# ---------------------------------------------------------------------------
+
+def _public_attachment_summary(att: Optional[dict]) -> Optional[dict]:
+    if not att:
+        return None
+    scores = att.get("att_scores") or _compute_att_scores(att)
+    return {
+        "attachment_id": _attachment_id(att),
+        "filename": att.get("filename"),
+        "ext": att.get("ext"),
+        "size": att.get("size"),
+        "doc_role": att.get("doc_role"),
+        "triage_score": att.get("triage_score"),
+        "triage_reasons": att.get("triage_reasons", []),
+        "confirmed": att.get("confirmed", False),
+        "excluded_reason": att.get("excluded_reason"),
+        "word_count": att.get("word_count"),
+        "business_signal_count": att.get("business_signal_count"),
+        "scores": scores,
+    }
+
+
+
+def _cheap_peek(file_bytes: bytes, ext: str) -> dict:
+    if ext in {"pptx", "ppt"}:
+        from .extraction.pptx import cheap_peek_pptx
+
+        return cheap_peek_pptx(file_bytes)
+    if ext == "pdf":
+        from .extraction.pdf import cheap_peek_pdf
+
+        return cheap_peek_pdf(file_bytes)
+    if ext in {"docx", "doc"}:
+        from .extraction.docx import cheap_peek_docx
+
+        return cheap_peek_docx(file_bytes)
+    return {}
+
+
 
 def _full_extract_text(file_bytes: bytes, ext: str) -> dict:
     """
-    Run just enough extraction to confirm the document is an idea card.
-    All formats go through MarkItDown via their respective module.
+    Extract enough text to support triage and downstream chunk routing.
     """
     try:
-        if ext in ("pptx", "ppt"):
+        if ext in {"pptx", "ppt"}:
             from .extraction.pptx import extract_pptx
+
             result = extract_pptx(file_bytes, max_slides=60)
         elif ext == "pdf":
             from .extraction.pdf import extract_pdf
+
             result = extract_pdf(file_bytes)
-        elif ext in ("docx", "doc"):
+        elif ext in {"docx", "doc"}:
             from .extraction.docx import extract_docx
+
             result = extract_docx(file_bytes)
         else:
             return {}
 
-        non_bp = sum(1 for c in result["chunks"] if not c.get("is_boilerplate"))
-        text = " ".join(c["text"] for c in result["chunks"] if not c.get("is_boilerplate"))
-        return {"text": text, "non_boilerplate_count": non_bp}
+        text_chunks: list[str] = []
+        non_bp = 0
+        template_hits = 0
 
+        for chunk in result.get("chunks", []):
+            text = (chunk.get("text") or "").strip()
+            if not text:
+                continue
+            text_chunks.append(text)
+            if not chunk.get("is_boilerplate"):
+                non_bp += 1
+            lowered = text.lower()
+            template_hits += sum(1 for p in TEMPLATE_PHRASES if p in lowered)
+
+        combined = "\n".join(text_chunks).strip()
+        return {
+            **result,
+            "text": combined,
+            "non_boilerplate_count": non_bp,
+            "template_phrase_hits": template_hits,
+        }
     except Exception as exc:
-        logger.debug("Full extraction failed for %s: %s", ext, exc)
+        logger.debug("Full extraction failed for ext=%s: %s", ext, exc)
+        return {}
 
-    return {}
+
+
+def _confirm_is_idea_card(extracted: Optional[dict]) -> bool:
+    if not extracted:
+        return False
+
+    text = (extracted.get("text") or "").strip()
+    if not text:
+        return False
+
+    words = _simple_words(text)
+    if len(words) < MIN_TEXT_WORDS_IDEA:
+        return False
+
+    if extracted.get("template_phrase_hits", 0) >= 2:
+        return False
+
+    if extracted.get("non_boilerplate_count", 0) < 2:
+        return False
+
+    business_signals = _business_signal_count(text)
+    if business_signals < 3:
+        return False
+
+    return True
+
+
+
+def _is_supporting_worthy(att: dict) -> bool:
+    scores = att.get("att_scores") or _compute_att_scores(att)
+    rr = scores.get("retrieval_readiness", 0.0)
+
+    if att.get("likely_template"):
+        return False
+    if att.get("confirmed"):
+        return True
+    if att.get("word_count", 0) >= MIN_TEXT_WORDS_SUPPORT and rr >= 0.35:
+        return True
+    if att.get("triage_score", 0) >= 35 and att.get("ext") in {"pptx", "ppt", "pdf", "docx", "doc"}:
+        return True
+    return False
+
+
+
+def _primary_key(att: dict) -> tuple[float, float, float, float]:
+    scores = att.get("att_scores") or _compute_att_scores(att)
+    return (
+        1.0 if att.get("confirmed") else 0.0,
+        float(scores.get("idea_card_likeness", 0.0)),
+        float(scores.get("retrieval_readiness", 0.0)),
+        float(att.get("triage_score", 0.0)),
+    )
+
+
+
+def _sort_key(att: dict) -> tuple[float, float, float, float]:
+    scores = att.get("att_scores") or _compute_att_scores(att)
+    return (
+        float(att.get("triage_score", 0.0)),
+        1.0 if att.get("confirmed") else 0.0,
+        float(scores.get("retrieval_readiness", 0.0)),
+        float(scores.get("idea_card_likeness", 0.0)),
+    )
+
+
+# -----------------------------------------------------------------------------
+# Generic utilities
+# -----------------------------------------------------------------------------
+
+
+def _attachment_id(att: Optional[dict]) -> str:
+    if not att:
+        return ""
+    return str(att.get("id") or att.get("attachment_id") or att.get("filename") or "")
+
+
+
+def _ext_of(att: dict) -> str:
+    filename = (att.get("filename") or "").lower()
+    if "." not in filename:
+        return ""
+    return filename.rsplit(".", 1)[-1]
+
+
+
+def _stem(att: dict) -> str:
+    filename = (att.get("filename") or "").lower().rsplit(".", 1)[0]
+    return re.sub(r"[^a-z0-9]+", " ", filename).strip()
+
+
+
+def _simple_words(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", (text or "").lower())
+
+
+
+def _business_signal_count(text: str) -> int:
+    words = set(_simple_words(text))
+    return sum(1 for term in BUSINESS_SIGNAL_TERMS if term in words)
+
+
+
+def _semantic_density(text: str) -> float:
+    words = _simple_words(text)
+    if not words:
+        return 0.0
+    unique_ratio = len(set(words)) / max(len(words), 1)
+    business_ratio = _business_signal_count(text) / 10.0
+    return round(min(1.0, 0.65 * unique_ratio + 0.35 * min(1.0, business_ratio)), 4)
+
+
