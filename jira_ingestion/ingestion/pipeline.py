@@ -24,15 +24,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from jira_ingestion import (  # noqa: E402
+from jira_ingestion import (
     JiraIngestionConfig,
     JiraValueStreamClient,
     create_indexes,
     ingest_ticket,
 )
-from src.clients.llm import IDPChatOpenAI  # noqa: E402
-from src.config import EMBEDDING_MODEL, JIRA_BASE_URL, JIRA_TOKEN  # noqa: E402
-
+from src.clients.embedding import EmbeddingClient
+from src.clients.llm import IDPChatOpenAI
+from src.config import (
+    EMBEDDING_DIMENSION,
+    EMBEDDING_MODEL,
+    JIRA_BASE_URL,
+    JIRA_TOKEN,
+)
 
 # ---------------------------------------------------------------------------
 # Ticket list / runtime knobs
@@ -54,12 +59,13 @@ TICKETS: List[str] = list(
 OUTPUT_DIR = Path(os.environ.get("TICKET_CHUNKS_DIR", "ticket_chunks"))
 VERIFY_SSL = os.environ.get("VERIFY_SSL", "false").lower() == "true"
 FORCE_REPROCESS = os.environ.get("FORCE_REPROCESS", "true").lower() == "true"
-MAX_CONCURRENT = int(os.environ.get("BATCH_MAX_CONCURRENT", "2"))
+MAX_CONCURRENT = int(os.environ.get("BATCH_MAX_CONCURRENT", "1"))
 ENABLE_LLM = os.environ.get("ENABLE_LLM", "true").lower() == "true"
+ENABLE_EMBEDDINGS = os.environ.get("ENABLE_EMBEDDINGS", "true").lower() == "true"
 
 
 # ---------------------------------------------------------------------------
-# OpenAI-shaped adapter for IDPChatOpenAI
+# OpenAI-shaped adapters
 # ---------------------------------------------------------------------------
 
 class _Message:
@@ -116,6 +122,51 @@ class _ChatAPI:
 class OpenAICompatibleLLM:
     def __init__(self, model: str = "gpt-4o-mini"):
         self.chat = _ChatAPI(_CompletionsAPI(IDPChatOpenAI(model=model)))
+
+
+class _EmbeddingData:
+    __slots__ = ("index", "embedding")
+
+    def __init__(self, index: int, embedding: List[float]):
+        self.index = index
+        self.embedding = embedding
+
+
+class _EmbeddingResponse:
+    __slots__ = ("data",)
+
+    def __init__(self, data: List[_EmbeddingData]):
+        self.data = data
+
+
+class _EmbeddingsAPI:
+    __slots__ = ("_client", "_model")
+
+    def __init__(self, client: EmbeddingClient, model: str):
+        self._client = client
+        self._model = model
+
+    def create(
+        self,
+        *,
+        input: str | List[str],
+        model: str | None = None,
+        **kwargs: Any,
+    ) -> _EmbeddingResponse:
+        texts = [input] if isinstance(input, str) else list(input)
+        model_name = model or self._model
+        vectors = self._client.embed_many(texts, model=model_name)
+        return _EmbeddingResponse(
+            data=[_EmbeddingData(index=i, embedding=v) for i, v in enumerate(vectors)]
+        )
+
+
+class OpenAICompatibleEmbeddingClient:
+    __slots__ = ("embeddings",)
+
+    def __init__(self, model: str = EMBEDDING_MODEL, dimension: int = EMBEDDING_DIMENSION):
+        client = EmbeddingClient(model=model, dimension=dimension)
+        self.embeddings = _EmbeddingsAPI(client, model=model)
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +334,20 @@ def _try_build_llm(model: str = "gpt-4o-mini") -> OpenAICompatibleLLM | None:
         return None
 
 
+def _try_build_embedding_client() -> OpenAICompatibleEmbeddingClient | None:
+    if not ENABLE_EMBEDDINGS:
+        logger.info("Embeddings disabled by ENABLE_EMBEDDINGS=false")
+        return None
+    try:
+        return OpenAICompatibleEmbeddingClient(
+            model=EMBEDDING_MODEL,
+            dimension=EMBEDDING_DIMENSION,
+        )
+    except Exception as exc:
+        logger.warning("Embedding client unavailable (%s) - continuing without embeddings", exc)
+        return None
+
+
 def _set_if_present(cfg: JiraIngestionConfig, name: str, value: Any) -> None:
     if hasattr(cfg, name):
         setattr(cfg, name, value)
@@ -295,23 +360,23 @@ def build_config() -> JiraIngestionConfig:
         llm_model="gpt-5-mini-idp",
         embedding_model=EMBEDDING_MODEL,
 
-        # verify-only run: do not persist pipeline artifacts locally
+        # verify/production hybrid: no local pipeline artifacts
         enable_raw_artifact_persistence=False,
         enable_attachment_text_persistence=False,
         enable_debug_stage_persistence=False,
         enable_prechunk_persistence=False,
 
-        # still useful for verification JSON
+        # keep useful output layers
         enable_attachment_inventory=True,
         enable_retrieval_views=True,
 
-        # cheaper verify pass
+        # production default
         skip_llm_summary=True,
         skip_llm_keywords=False,
         skip_llm_derived=True,
     )
 
-    # Important multi-doc verification knobs
+    # Multi-doc safe knobs
     _set_if_present(cfg, "section_only_chunks", False)
     _set_if_present(cfg, "include_section_rollups_in_retrieval", False)
     _set_if_present(cfg, "section_min_slides", 1)
@@ -360,7 +425,7 @@ def _observed_chunk_type_counts(obs: dict) -> Dict[str, int]:
     return dict(sorted(counts.items(), key=lambda x: x[0]))
 
 
-def _json_attachment_counts(chunk_records: List[dict]) -> Dict[str, int]:
+def _json_attachment_chunk_counts(chunk_records: List[dict]) -> Dict[str, int]:
     counts: Dict[str, int] = {}
     for rec in chunk_records:
         refs = rec.get("attachmentReferences") or []
@@ -385,8 +450,8 @@ async def process_ticket(
     supervision_store: Any,
     cfg: JiraIngestionConfig,
     llm_client: Any,
+    embedding_client: Any,
 ) -> Tuple[List[dict], dict]:
-    """Run ingestion and write only verification JSON under ticket_chunks/<ticket_id>/."""
     ticket_dir = OUTPUT_DIR / ticket_id
     ticket_dir.mkdir(parents=True, exist_ok=True)
 
@@ -410,8 +475,8 @@ async def process_ticket(
         supervision_store=supervision_store,
         config=cfg,
         llm_client=llm_client,
-        embedding_client=None,   # verify-only: no embedding cost / no local vectors
-        storage_dir=None,        # do not write pipeline debug artifacts locally
+        embedding_client=embedding_client,
+        storage_dir=None,
     )
 
     obs = result.get("observed", {})
@@ -421,7 +486,6 @@ async def process_ticket(
         for c in obs.get("chunks", [])
     ]
 
-    # ---- logs you want for doc checking ----
     logger.info("%s CONFIG %s", ticket_id, _config_snapshot(cfg))
     logger.info(
         "%s OBSERVED chunks=%d attachment_refs=%s",
@@ -437,7 +501,13 @@ async def process_ticket(
     logger.info(
         "%s JSON attachment_chunk_counts=%s",
         ticket_id,
-        _json_attachment_counts(chunk_records),
+        _json_attachment_chunk_counts(chunk_records),
+    )
+    logger.info(
+        "%s EMBEDDINGS populated=%d/%d",
+        ticket_id,
+        sum(1 for r in chunk_records if r.get("content_vector") is not None),
+        len(chunk_records),
     )
 
     dump_json(
@@ -470,9 +540,17 @@ async def main() -> None:
     cfg = build_config()
     coarse, fine, metadata_index, supervision_store = _create_memory_indexes()
     llm_client = _try_build_llm()
+    embedding_client = _try_build_embedding_client()
 
     logger.info("OUTPUT_DIR=%s", OUTPUT_DIR)
-    logger.info("FORCE_REPROCESS=%s MAX_CONCURRENT=%s VERIFY_SSL=%s", FORCE_REPROCESS, MAX_CONCURRENT, VERIFY_SSL)
+    logger.info(
+        "FORCE_REPROCESS=%s MAX_CONCURRENT=%s VERIFY_SSL=%s ENABLE_LLM=%s ENABLE_EMBEDDINGS=%s",
+        FORCE_REPROCESS,
+        MAX_CONCURRENT,
+        VERIFY_SSL,
+        ENABLE_LLM,
+        ENABLE_EMBEDDINGS,
+    )
     logger.info("GLOBAL CONFIG %s", _config_snapshot(cfg))
 
     all_chunks: List[dict] = []
@@ -496,6 +574,7 @@ async def main() -> None:
                     supervision_store,
                     cfg,
                     llm_client,
+                    embedding_client,
                 )
                 return ticket_id, chunks, vs_map, None
             except Exception as exc:
